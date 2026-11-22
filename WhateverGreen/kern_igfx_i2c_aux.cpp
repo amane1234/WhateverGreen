@@ -88,7 +88,10 @@ IOReturn IGFX::AdvancedI2COverAUXSupport::advSeekI2COverAUX(void *that, IORegist
 
 	// Write a single byte to the given I2C slave
 	// and set the Middle-of-Transaction bit to 1
-	return wrapWriteI2COverAUX(that, framebuffer, displayPath, address, 1, reinterpret_cast<uint8_t*>(&offset), true);
+	retVal = wrapWriteI2COverAUX(that, framebuffer, displayPath, address, 1, reinterpret_cast<uint8_t*>(&offset), true);
+	if (retVal != kIOReturnSuccess)
+		wrapWriteI2COverAUX(that, framebuffer, displayPath, address, 0, nullptr, false);
+	return retVal;
 }
 
 IOReturn IGFX::AdvancedI2COverAUXSupport::advReadI2COverAUX(void *that, IORegistryEntry *framebuffer, void *displayPath, uint32_t address, uint32_t offset, uint16_t length, uint8_t *buffer, uint8_t flags) {

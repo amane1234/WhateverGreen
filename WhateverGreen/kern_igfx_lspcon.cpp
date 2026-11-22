@@ -96,26 +96,20 @@ IOReturn LSPCON::setMode(Mode newMode) {
 	}
 
 	// Read the register again and verify the mode
-	uint32_t timeout = 200;
 	Mode mode;
-	while (timeout != 0) {
+	for (uint32_t timeout = 200; timeout != 0; timeout -= 20) {
 		retVal = getMode(mode);
-		// Guard: Read the current effective mode
 		if (retVal != kIOReturnSuccess) {
-			SYSLOG("igfx", "SC: LSPCON::setMode() Error: [FB%d] Failed to read the new effective mode. RV = 0x%llx.", index, retVal);
-			continue;
-		}
-		// Guard: The new mode is effective now
-		if (mode == newMode) {
+			SYSLOG("igfx", "SC: LSPCON::setMode() Error: [FB%d] Failed to read the new effective mode. RV = 0x%x.", index, retVal);
+		} else if (mode == newMode) {
 			DBGLOG("igfx", "SC: LSPCON::setMode() DInfo: [FB%d] The new mode is now effective.", index);
 			return kIOReturnSuccess;
 		}
-		timeout -= 20;
 		IOSleep(20);
 	}
 
-	SYSLOG("igfx", "SC: LSPCON::setMode() Error: [FB%d] Timed out while waiting for the new mode to be effective. Last RV = 0x%llx.", index, retVal);
-	return retVal;
+	SYSLOG("igfx", "SC: LSPCON::setMode() Error: [FB%d] Timed out while waiting for the new mode to be effective. Last RV = 0x%x.", index, retVal);
+	return retVal == kIOReturnSuccess ? kIOReturnTimeout : retVal;
 }
 
 IOReturn LSPCON::setModeIfNecessary(Mode newMode) {
@@ -172,12 +166,12 @@ void IGFX::LSPCONDriverSupport::processKernel(KernelPatcher &patcher, DeviceInfo
 	// Read the user-defined IGPU properties to know whether a connector has an onboard LSPCON chip
 	if (enabled) {
 		char name[48];
-		uint32_t pmode = 0x01; // PCON mode as a fallback value
 		for (size_t index = 0; index < arrsize(lspcons); index++) {
 			bzero(name, sizeof(name));
 			snprintf(name, sizeof(name), "framebuffer-con%lu-has-lspcon", index);
 			(void)WIOKit::getOSDataValue(info->videoBuiltin, name, lspcons[index].hasLSPCON);
 			snprintf(name, sizeof(name), "framebuffer-con%lu-preferred-lspcon-mode", index);
+			uint32_t pmode = 0x01; // PCON is the default for each connector.
 			(void)WIOKit::getOSDataValue(info->videoBuiltin, name, pmode);
 			// Assuming PCON mode if invalid mode value (i.e. > 1) specified by the user
 			lspcons[index].preferredMode = LSPCON::Mode::parse(pmode != 0);
@@ -269,6 +263,7 @@ void IGFX::LSPCONDriverSupport::setupLSPCON(void *that, IORegistryEntry *framebu
 	// Guard: Set the preferred adapter mode if necessary
 	if (lspcon->setModeIfNecessary(pmode) != kIOReturnSuccess) {
 		SYSLOG("igfx", "SC: fbSetupLSPCON() Error: [FB%d] The adapter is not running in preferred mode. Failed to set the %s mode.", index, pmode.getDescription());
+		return;
 	}
 	DBGLOG("igfx", "SC: fbSetupLSPCON() DInfo: [FB%d] The adapter is now running in preferred mode [%s].", index, pmode.getDescription());
 }

@@ -331,8 +331,8 @@ public:
 	 *
 	 *  @param newMode The new adapter mode
 	 *  @return `kIOReturnSuccess` on success, errors otherwise.
-	 *  @note This method will not return until `newMode` is effective.
-	 *  @warning This method will return the result of the last attempt if timed out on waiting for `newMode` to be effective.
+	 *  @note If polling ends without confirming the mode, returns the last read error or
+	 *        `kIOReturnTimeout` if the last read succeeded with a different mode.
 	 */
 	IOReturn setMode(Mode newMode);
 
