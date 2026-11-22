@@ -1246,47 +1246,38 @@ bool BrightnessRequestEventSource::checkForWork() {
 	uint32_t current = IGFX::callbackIGFX->readRegister32(request.controller, request.address);
 	uint32_t cbrightness = request.getCurrentBrightness(current);
 	uint32_t tbrightness = request.getTargetBrightness();
+	tbrightness = max(tbrightness, smoother->brightnessRange.first);
+	tbrightness = min(tbrightness, smoother->brightnessRange.second);
+	tbrightness = min(tbrightness, request.mask); // Limit the brightness to the width of the duty field.
+	uint32_t target = request.getTargetRegisterValue(tbrightness);
 
-	if (cbrightness == tbrightness) {
+	// A packed PWM register can change frequency while its duty field stays the same.
+	if (current == target) {
 		DBGLOG("igfx", "BLS: [COMM] The request is already completed. Will wait for the next invocation.");
-		return false;		
+		return smoother->request.id != request.id;
 	}
 	
-	tbrightness = max(tbrightness, smoother->brightnessRange.first);  // Ensure that target >= lowerbound
-	tbrightness = min(tbrightness, smoother->brightnessRange.second); // Ensure that target <= upperbound
 	uint32_t distance = max(cbrightness, tbrightness) - min(cbrightness, tbrightness);
 	DBGLOG("igfx", "BLS: [COMM] Processing the request: Current = 0x%08x; Target = 0x%08x; Distance = %04u; Steps = %u.",
 		   cbrightness, tbrightness, distance, smoother->steps);
 	
 	// Process the request
 	if (distance > smoother->threshold) {
-		if (cbrightness < tbrightness) {
-			// Increase the brightness
-			for (uint32_t i = 1; i < smoother->steps; i++) {
-				uint32_t value = cbrightness + i * distance / smoother->steps;
-				IGFX::callbackIGFX->writeRegister32(request.controller, request.address, request.getTargetRegisterValue(value));
-				IOSleep(smoother->interval);
-				if (smoother->request.id != request.id) {
-					return true; // Start again, because there is a new request
-				}
-			}
-		} else if (cbrightness > tbrightness) {
-			// Decrease the brightness
-			for (uint32_t i = 1; i < smoother->steps; i++) {
-				uint32_t value = cbrightness - i * distance / smoother->steps;
-				IGFX::callbackIGFX->writeRegister32(request.controller, request.address, request.getTargetRegisterValue(value));
-				IOSleep(smoother->interval);
-				if (smoother->request.id != request.id) {
-					return true; // Start again, because there is a new request
-				}
+		for (uint32_t i = 1; i < smoother->steps; i++) {
+			uint32_t offset = static_cast<uint32_t>(static_cast<uint64_t>(i) * distance / smoother->steps);
+			uint32_t value = cbrightness < tbrightness ? cbrightness + offset : cbrightness - offset;
+			IGFX::callbackIGFX->writeRegister32(request.controller, request.address, request.getTargetRegisterValue(value));
+			IOSleep(smoother->interval);
+			if (smoother->request.id != request.id) {
+				return true; // Start again, because there is a new request
 			}
 		}
 	} else {
 		DBGLOG("igfx", "BLS: [COMM] Distance is too short. Will set the target value directly.");
 	}
 	
-	// Finish by writting the target value
-	IGFX::callbackIGFX->writeRegister32(request.controller, request.address, request.getTargetRegisterValue(tbrightness));
+	// Finish by writing the target value
+	IGFX::callbackIGFX->writeRegister32(request.controller, request.address, target);
 	[[maybe_unused]] uint64_t enanosecs = getCurrentTimeNs();
 	DBGLOG("igfx", "BLS: [COMM] The request completed in %llu nanoseconds.", enanosecs - snanosecs);
 	
