@@ -37,6 +37,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMessage.h>
 #include <mach/clock.h>
+#include <kern/thread_call.h>
 
 #include "kern_igfx.hpp"
 
@@ -54,6 +55,35 @@ struct [[gnu::packed]] IGHwCsDesc {
 
 constexpr uint32_t MCHBAR_MIRROR_BASE_SNB = 0x140000;
 constexpr uint32_t GEN6_RP_STATE_CAP = MCHBAR_MIRROR_BASE_SNB + 0x5998;
+
+constexpr uint32_t GEN6_RC_CONTROL = 0xA090;
+constexpr uint32_t GEN6_RC_CTL_RC6_ENABLE = 1U << 18;
+constexpr uint32_t GEN9_PG_ENABLE = 0xA210;
+constexpr uint32_t GEN6_GT_GFX_RC6 = 0x138108;
+
+/**
+ *  RC6 configuration registers in the order i915 (gen9_rc6_enable) programs them.
+ *  RC_CONTROL and PG_ENABLE come last, after the parameters they depend on.
+ */
+constexpr uint32_t RC6_REGISTERS[] {
+	0xA09C, // GEN6_RC6_WAKE_RATE_LIMIT
+	0xA0A8, // GEN6_RC_EVALUATION_INTERVAL
+	0xA0AC, // GEN6_RC_IDLE_HYSTERSIS
+	0xA0B0, // GEN6_RC_SLEEP
+	0xA0B8, // GEN6_RC6_THRESHOLD
+	0xA0C4, // GEN9_MEDIA_PG_IDLE_HYSTERESIS
+	0xA0C8, // GEN9_RENDER_PG_IDLE_HYSTERESIS
+	GEN6_RC_CONTROL,
+	GEN9_PG_ENABLE,
+};
+
+enum RC6Event : uint32_t {
+	RC6EventSnapshot  = 1U << 0,
+	RC6EventRestored  = 1U << 1,
+	RC6EventGiveUp    = 1U << 2,
+	RC6EventNever     = 1U << 3,
+	RC6EventStall     = 1U << 4,
+};
 
 constexpr uint32_t GEN9_FREQUENCY_SHIFT = 23;
 constexpr uint32_t GEN9_FREQ_SCALER  = 3;
@@ -142,8 +172,24 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 	if (PE_parse_boot_argn("igfxrpsc", &rpsc, sizeof(rpsc)) ||
 		WIOKit::getOSDataValue(info->videoBuiltin, "rps-control", rpsc)) {
 		enabled = rpsc > 0 && available;
-		mode = rpsc >= 2 ? 2 : 1;
+		mode = rpsc == 0 ? 0 : (rpsc >= 2 ? 2 : 1);
 		DBGLOG("weg", "RPS control patch overriden (%u) availabile %d", rpsc, available);
+	}
+
+	// The RC6 monitor runs in the same pmNotifyWrapper hook, with or without RPS control
+	rc6Fix = available && (checkKernelArgument("-igfxrc6fix") ||
+		(info->videoBuiltin && info->videoBuiltin->getProperty("enable-rc6-fix") != nullptr));
+	if (rc6Fix) {
+		rc6LogCall = thread_call_allocate(reinterpret_cast<thread_call_func_t>(logRC6), this);
+		if (rc6LogCall) {
+			enabled = true;
+			requiresMMIORegistersWriteAccess = true;
+			nanoseconds_to_absolutetime(1000ULL * 1000 * 1000, &rc6CheckInterval);
+			SYSLOG(log, "RC6 monitor enabled (RPS control mode %u)", mode);
+		} else {
+			rc6Fix = false;
+			SYSLOG(log, "Failed to allocate the RC6 monitor log call");
+		}
 	}
 
 	// Submissions closer together than this mean the GPU is under sustained load
@@ -162,6 +208,10 @@ void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_
 }
 
 void IGFX::RPSControlPatch::processGraphicsKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	// The RC6 monitor alone needs no RPS changes
+	if (mode == 0)
+		return;
+
 	// Address of `IGHardwareCommandStreamer2::submitExecList`
 	mach_vm_address_t orgSubmitExecList;
 	
@@ -183,6 +233,17 @@ void IGFX::RPSControlPatch::processGraphicsKext(KernelPatcher &patcher, size_t i
 
 int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1, unsigned long long *a2, unsigned int *freq) {
 	auto &self = callbackIGFX->modRPSControlPatch;
+
+	if (self.mode == 0) {
+		// RC6 monitor only
+		int ret = self.orgPmNotifyWrapper(a0, a1, a2, freq);
+		self.checkRC6();
+		return ret;
+	}
+
+	// Submissions only happen with the GT awake, which is when the RC6 registers can be read
+	if (self.rc6Fix)
+		self.checkRC6();
 
 	if (self.mode == 2) {
 		// Legacy mode: request the maximum RPS at every exec list submission.
@@ -225,6 +286,123 @@ int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1,
 
 	*freq = (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * self.freq_max;
 	return 0;
+}
+
+void IGFX::RPSControlPatch::postRC6Event(uint32_t event, uint32_t v0, uint32_t v1, uint32_t v2) {
+	// Called from the submission path, which may run in interrupt context: only record the event here
+	// and log it from a thread call
+	rc6LogValue[0] = v0;
+	rc6LogValue[1] = v1;
+	rc6LogValue[2] = v2;
+	__atomic_fetch_or(&rc6Events, event, __ATOMIC_RELEASE);
+	thread_call_enter(static_cast<thread_call_t>(rc6LogCall));
+}
+
+void IGFX::RPSControlPatch::logRC6(void *param0, void *) {
+	auto &self = *static_cast<RPSControlPatch *>(param0);
+	uint32_t events = __atomic_exchange_n(&self.rc6Events, 0, __ATOMIC_ACQUIRE);
+	uint32_t v0 = self.rc6LogValue[0], v1 = self.rc6LogValue[1], v2 = self.rc6LogValue[2];
+
+	if (events & RC6EventSnapshot)
+		SYSLOG(log, "RC6: recorded the driver's RC6 configuration, RC_CONTROL 0x%08x PG_ENABLE 0x%08x", v0, v1);
+	if (events & RC6EventRestored)
+		SYSLOG(log, "RC6: RC6 was disabled (RC_CONTROL 0x%08x), restored RC_CONTROL 0x%08x (attempt %u)", v0, v1, v2);
+	if (events & RC6EventGiveUp)
+		SYSLOG(log, "RC6: the driver keeps RC6 disabled (RC_CONTROL 0x%08x), no more restores until RC6 is enabled again", v0);
+	if (events & RC6EventNever)
+		SYSLOG(log, "RC6: the driver never enabled RC6 (RC_CONTROL 0x%08x), nothing to restore", v0);
+	if (events & RC6EventStall)
+		SYSLOG(log, "RC6: RC6 is enabled but residency has not advanced for 60 s. Forcewake render ack 0x%08x media ack 0x%08x "
+			   "(bits held all the time mean a leaked forcewake reference keeps the GT out of RC6)", v0, v1);
+}
+
+void IGFX::RPSControlPatch::checkRC6() {
+	// Check at most once per second. The compare-exchange also keeps concurrent submissions out.
+	uint64_t now = mach_absolute_time();
+	uint64_t next = __atomic_load_n(&rc6NextCheck, __ATOMIC_RELAXED);
+	if (now < next || !__atomic_compare_exchange_n(&rc6NextCheck, &next, now + rc6CheckInterval, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+		return;
+
+	auto controller = callbackIGFX->defaultController();
+	if (!controller)
+		return;
+
+	// Read GT registers only while the render well is awake. Otherwise they read as 0, which would look
+	// like a lost configuration.
+	uint32_t ackRender = callbackIGFX->readRegister32(controller, FORCEWAKE_ACK_RENDER_GEN9);
+	if ((ackRender & 0xFFFF) == 0 || ackRender == 0xFFFFFFFF)
+		return;
+
+	uint32_t rcControl = callbackIGFX->readRegister32(controller, GEN6_RC_CONTROL);
+	constexpr size_t controlIndex = arrsize(RC6_REGISTERS) - 2;
+	constexpr size_t pgIndex = arrsize(RC6_REGISTERS) - 1;
+
+	if (rcControl & GEN6_RC_CTL_RC6_ENABLE) {
+		rc6LostCount = 0;
+		if (!rc6EnabledSince)
+			rc6EnabledSince = now;
+
+		if (!rc6HaveSnapshot) {
+			// Wait until the driver's configuration is stable
+			if (++rc6GoodCount >= 3) {
+				for (size_t i = 0; i < arrsize(RC6_REGISTERS); i++)
+					rc6Snapshot[i] = callbackIGFX->readRegister32(controller, RC6_REGISTERS[i]);
+				rc6HaveSnapshot = true;
+				rc6LastResidency = callbackIGFX->readRegister32(controller, GEN6_GT_GFX_RC6);
+				rc6ResidencyChanged = now;
+				postRC6Event(RC6EventSnapshot, rc6Snapshot[controlIndex], rc6Snapshot[pgIndex]);
+			}
+			return;
+		}
+
+		// RC6 that stays enabled for a minute resets the restore limit
+		if (rc6FailedRestores && now - rc6EnabledSince >= 60 * rc6CheckInterval)
+			rc6FailedRestores = 0;
+
+		// Residency should advance between submissions on an idle desktop. When it does not, something
+		// (usually a held forcewake reference) keeps the GT awake: report it, it is not safe to fix here.
+		uint32_t residency = callbackIGFX->readRegister32(controller, GEN6_GT_GFX_RC6);
+		if (residency != rc6LastResidency) {
+			rc6LastResidency = residency;
+			rc6ResidencyChanged = now;
+		} else if (now - rc6ResidencyChanged >= 60 * rc6CheckInterval && now >= rc6NextStallReport) {
+			rc6NextStallReport = now + 600 * rc6CheckInterval;
+			postRC6Event(RC6EventStall, ackRender, callbackIGFX->readRegister32(controller, FORCEWAKE_ACK_MEDIA_GEN9));
+		}
+		return;
+	}
+
+	rc6GoodCount = 0;
+	rc6EnabledSince = 0;
+	rc6ResidencyChanged = now;
+
+	if (!rc6HaveSnapshot) {
+		if (++rc6NeverCount == 60)
+			postRC6Event(RC6EventNever, rcControl);
+		return;
+	}
+
+	// RC6 has to stay disabled for 5 checks before restoring it, so the driver's own reprogramming
+	// (wake, GPU reset) is not interrupted
+	if (++rc6LostCount < 5 || rc6FailedRestores >= 3)
+		return;
+	rc6LostCount = 0;
+
+	// A restore that did not hold for 30 s means the driver disables RC6 on purpose: stop after 3
+	if (rc6LastRestore && now - rc6LastRestore < 30 * rc6CheckInterval && ++rc6FailedRestores >= 3) {
+		postRC6Event(RC6EventGiveUp, rcControl);
+		return;
+	}
+	rc6LastRestore = now;
+
+	for (size_t i = 0; i < arrsize(RC6_REGISTERS); i++) {
+		if (RC6_REGISTERS[i] == GEN9_PG_ENABLE && rc6Snapshot[i] == 0)
+			continue;
+		if (callbackIGFX->readRegister32(controller, RC6_REGISTERS[i]) != rc6Snapshot[i])
+			callbackIGFX->writeRegister32(controller, RC6_REGISTERS[i], rc6Snapshot[i]);
+	}
+
+	postRC6Event(RC6EventRestored, rcControl, rc6Snapshot[controlIndex], rc6FailedRestores + 1);
 }
 
 bool IGFX::RPSControlPatch::patchRCSCheck(mach_vm_address_t& start) {

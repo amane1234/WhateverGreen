@@ -121,6 +121,7 @@ Read [FAQs](./Manual/) and avoid asking any questions. No support is provided fo
 | `igfxonlnfbs=MASK`| `force-online-framebuffers` property on IGPU 	| Specify indices of connectors for which online status is enforced. Format is similar to `igfxfcmsfbs` 	|
 | `igfxpavp=1` 		  | `igfxpavp` property on IGPU 	| Force enable PAVP output 	|
 | `igfxrpsc=1` 		 	| `rps-control` property on IGPU 	| Enable RPS control patch (improves IGPU performance). `1` boosts to the maximum frequency only under sustained load, `2` always requests the maximum frequency (old behaviour, can keep the GPU at maximum clock after S3/S4 sleep) 	|
+| `-igfxrc6fix` 		 	| `enable-rc6-fix` property on IGPU 	| Restore the RC6 (GPU idle power state) configuration when it is lost, e.g. after S3/S4 sleep, and log RC6 problems (`igfx_pm` in the kernel log). SKL/KBL/CFL/CML only 	|
 | `igfxsnb=0` 		  | N/A 	| Disable IntelAccelerator name fix for Sandy Bridge CPUs 	|
 
 ##### Backlight

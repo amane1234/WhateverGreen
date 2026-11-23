@@ -1297,6 +1297,31 @@ private:
 		uint64_t lastNotify {0};
 		uint64_t busyInterval {0};
 
+		/**
+		 *  RC6 monitor (-igfxrc6fix): records the RC6 configuration the driver programmed and restores it
+		 *  when it was lost (e.g. after S3/S4), and logs RC6 problems it cannot fix
+		 */
+		bool rc6Fix {false};
+		bool rc6HaveSnapshot {false};
+		uint32_t rc6GoodCount {0};
+		uint32_t rc6LostCount {0};
+		uint32_t rc6NeverCount {0};
+		uint32_t rc6FailedRestores {0};
+		uint32_t rc6LastResidency {0};
+		uint32_t rc6Snapshot[9] {};
+		uint64_t rc6CheckInterval {0};
+		uint64_t rc6NextCheck {0};
+		uint64_t rc6ResidencyChanged {0};
+		uint64_t rc6EnabledSince {0};
+		uint64_t rc6LastRestore {0};
+		uint64_t rc6NextStallReport {0};
+		void *rc6LogCall {nullptr};
+		uint32_t rc6Events {0};
+		uint32_t rc6LogValue[3] {};
+		void checkRC6();
+		void postRC6Event(uint32_t event, uint32_t v0, uint32_t v1 = 0, uint32_t v2 = 0);
+		static void logRC6(void *param0, void *param1);
+
 		bool patchRCSCheck(mach_vm_address_t& start);
 		int (*orgPmNotifyWrapper)(unsigned int, unsigned int, unsigned long long *, unsigned int *) {nullptr};
 		static int wrapPmNotifyWrapper(unsigned int, unsigned int, unsigned long long *, unsigned int *);
