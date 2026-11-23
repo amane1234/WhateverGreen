@@ -1284,6 +1284,19 @@ private:
 	 */
 	class RPSControlPatch: public PatchSubmodule {
 		uint32_t freq_max {0};
+
+		/**
+		 *  rps-control mode: 1 boosts to RP0 only while command submissions arrive back to back (busy GPU),
+		 *  2 always requests RP0 (legacy behaviour)
+		 */
+		uint32_t mode {0};
+
+		/**
+		 *  Time of the previous submission notification and the maximum gap that still counts as busy
+		 */
+		uint64_t lastNotify {0};
+		uint64_t busyInterval {0};
+
 		bool patchRCSCheck(mach_vm_address_t& start);
 		int (*orgPmNotifyWrapper)(unsigned int, unsigned int, unsigned long long *, unsigned int *) {nullptr};
 		static int wrapPmNotifyWrapper(unsigned int, unsigned int, unsigned long long *, unsigned int *);

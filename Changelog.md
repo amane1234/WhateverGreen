@@ -8,6 +8,7 @@
 - Fixed `-igfxdvmt` patching a DVMT of 0 MB for reserved GMS values, matching shr/or instructions, and patching with mismatching registers or lengths
 - Fixed `-igfxcdc` calling unresolved functions when only the probe function could be routed
 - Fixed RPS control requesting the lowest GPU frequency while RP0 could not be read
+- Fixed `igfxrpsc=1` pinning the GPU at its maximum frequency after S3/S4 sleep: the patch now boosts only under sustained load and otherwise keeps the driver's frequency (`igfxrpsc=2` restores the old always-maximum behaviour)
 - Fixed framebuffer patches reading and writing past the framebuffer region and leaking skipped patch data
 
 #### v1.7.0

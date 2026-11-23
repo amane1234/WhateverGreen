@@ -142,8 +142,12 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 	if (PE_parse_boot_argn("igfxrpsc", &rpsc, sizeof(rpsc)) ||
 		WIOKit::getOSDataValue(info->videoBuiltin, "rps-control", rpsc)) {
 		enabled = rpsc > 0 && available;
+		mode = rpsc >= 2 ? 2 : 1;
 		DBGLOG("weg", "RPS control patch overriden (%u) availabile %d", rpsc, available);
 	}
+
+	// Submissions closer together than this mean the GPU is under sustained load
+	nanoseconds_to_absolutetime(8 * 1000 * 1000, &busyInterval);
 }
 
 void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -178,24 +182,48 @@ void IGFX::RPSControlPatch::processGraphicsKext(KernelPatcher &patcher, size_t i
 }
 
 int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1, unsigned long long *a2, unsigned int *freq) {
-	// Request the maximum RPS at exec list submission
-	// While this sounds dangerous, we are still getting proper power management due to force wake clears.
-	uint32_t cfreq = 0;
-	callbackIGFX->modRPSControlPatch.orgPmNotifyWrapper(a0, a1, a2, &cfreq);
-	
-	if (!callbackIGFX->modRPSControlPatch.freq_max) {
-		callbackIGFX->modRPSControlPatch.freq_max = callbackIGFX->readRegister32(callbackIGFX->defaultController(), GEN6_RP_STATE_CAP) & 0xFF;
-		DBGLOG(log, "Read RP0 %d", callbackIGFX->modRPSControlPatch.freq_max);
-	}
-	
-	// Without RP0 (register not readable yet) keep the frequency the driver asked for: 0 would request
-	// the lowest frequency instead of the highest one
-	if (callbackIGFX->modRPSControlPatch.freq_max == 0) {
-		*freq = cfreq;
+	auto &self = callbackIGFX->modRPSControlPatch;
+
+	if (self.mode == 2) {
+		// Legacy mode: request the maximum RPS at every exec list submission.
+		// This relies on RC6 (force wake clears) to save power. When RC6 is not entered again after
+		// S3/S4, the GPU stays at RP0 for the rest of the session.
+		uint32_t cfreq = 0;
+		self.orgPmNotifyWrapper(a0, a1, a2, &cfreq);
+
+		if (!self.freq_max) {
+			self.freq_max = callbackIGFX->readRegister32(callbackIGFX->defaultController(), GEN6_RP_STATE_CAP) & 0xFF;
+			DBGLOG(log, "Read RP0 %d", self.freq_max);
+		}
+
+		// Without RP0 (register not readable yet) keep the frequency the driver asked for: 0 would request
+		// the lowest frequency instead of the highest one
+		*freq = self.freq_max ? (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * self.freq_max : cfreq;
 		return 0;
 	}
 
-	*freq = (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * callbackIGFX->modRPSControlPatch.freq_max;
+	// Adaptive mode: let the driver (AGPM) pick the frequency, and only boost to RP0 while submissions
+	// arrive back to back. Every request used to be RP0, so the frequency only dropped through RC6.
+	// After S3/S4 sleep, the GPU was then pinned at the maximum clock. Now the next light submission
+	// (cursor, compositor) restores the driver's own choice.
+	int ret = self.orgPmNotifyWrapper(a0, a1, a2, freq);
+
+	uint64_t now = mach_absolute_time();
+	uint64_t last = __atomic_exchange_n(&self.lastNotify, now, __ATOMIC_RELAXED);
+	// last > now: the timestamp came from another CPU a moment ago, treat it as busy
+	bool busy = last != 0 && (now < last || now - last <= self.busyInterval);
+	if (!busy)
+		return ret;
+
+	if (!self.freq_max) {
+		self.freq_max = callbackIGFX->readRegister32(callbackIGFX->defaultController(), GEN6_RP_STATE_CAP) & 0xFF;
+		DBGLOG(log, "Read RP0 %d", self.freq_max);
+	}
+
+	if (self.freq_max == 0)
+		return ret;
+
+	*freq = (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * self.freq_max;
 	return 0;
 }
 
