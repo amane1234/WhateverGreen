@@ -249,10 +249,11 @@ void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_
 			SYSLOG(log, "Failed to route pmNotifyWrapper.");
 	}
 
-	// The doPMWork command numbers were verified on the KBL framebuffer only
-	if (gtFloorCap && callbackIGFX->getRealFramebuffer(index) != &kextIntelKBLFb) {
-		SYSLOG(log, "GT floor cap is only supported with the KBL framebuffer, disabled.");
-		publish("weg-gt-floor-status", "disabled: not the KBL framebuffer");
+	// The doPMWork command numbers were verified on the KBL and CFL framebuffers only
+	auto framebuffer = callbackIGFX->getRealFramebuffer(index);
+	if (gtFloorCap && framebuffer != &kextIntelKBLFb && framebuffer != &kextIntelCFLFb) {
+		SYSLOG(log, "GT floor cap is only supported with the KBL and CFL framebuffers, disabled.");
+		publish("weg-gt-floor-status", "disabled: not the KBL or CFL framebuffer");
 		gtFloorCap = 0;
 	}
 
