@@ -175,7 +175,22 @@ void IGFX::RPSControlPatch::init() {
 	requiresMMIORegistersReadAccess = true;
 }
 
+void IGFX::RPSControlPatch::publish(const char *key, uint32_t value) {
+	if (igpu)
+		igpu->setProperty(key, value, 32);
+}
+
+void IGFX::RPSControlPatch::publish(const char *key, const char *value) {
+	if (igpu)
+		igpu->setProperty(key, value);
+}
+
 void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
+	if (available && info->videoBuiltin && !igpu) {
+		igpu = info->videoBuiltin;
+		igpu->retain();
+	}
+
 	uint32_t rpsc = 0;
 	if (PE_parse_boot_argn("igfxrpsc", &rpsc, sizeof(rpsc)) ||
 		WIOKit::getOSDataValue(info->videoBuiltin, "rps-control", rpsc)) {
@@ -211,6 +226,14 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 		gtFloorCap = (floorMHz + 49) / 50;
 		enabled = true;
 		SYSLOG(log, "GT floor capped at %u MHz", gtFloorCap * 50);
+		publish("weg-gt-floor-cap", gtFloorCap * 50);
+		publish("weg-gt-floor-status", "waiting for AGPM floor request");
+	}
+
+	if (enabled) {
+		publish("weg-rps-control-mode", mode);
+		if (rc6Fix)
+			publish("weg-rc6-status", "monitoring");
 	}
 }
 
@@ -229,6 +252,7 @@ void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_
 	// The doPMWork command numbers were verified on the KBL framebuffer only
 	if (gtFloorCap && callbackIGFX->getRealFramebuffer(index) != &kextIntelKBLFb) {
 		SYSLOG(log, "GT floor cap is only supported with the KBL framebuffer, disabled.");
+		publish("weg-gt-floor-status", "disabled: not the KBL framebuffer");
 		gtFloorCap = 0;
 	}
 
@@ -241,6 +265,7 @@ void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_
 
 		if (!patcher.routeMultiple(index, &routeRequest, 1, address, size)) {
 			SYSLOG(log, "Failed to route doPMWork, GT floor cap disabled.");
+			publish("weg-gt-floor-status", "disabled: doPMWork not found");
 			gtFloorCap = 0;
 		}
 	}
@@ -262,13 +287,19 @@ IOReturn IGFX::RPSControlPatch::wrapDoPMWork(void *controller, uint32_t cmd, voi
 		if (rp0 && floor > rp0)
 			floor = rp0;
 
+		// doPMWork runs on the framebuffer's command gate, so publishing (registry lock) is fine here
+		if (self.gtFloorLogged != requested + 1) {
+			self.gtFloorLogged = requested + 1;
+			self.publish("weg-gt-floor-agpm", requested * 50);
+			self.publish("weg-gt-floor-applied", (requested > floor ? floor : requested) * 50);
+			self.publish("weg-gt-floor-rpn", rpn * 50);
+			self.publish("weg-gt-floor-status", requested > floor ? "lowered AGPM floor" : "AGPM floor already low enough");
+			SYSLOG(log, "GT%u floor: AGPM requested %u MHz, using %u MHz (RPn %u MHz)",
+				   cmd == PMWORK_GT2_FLOOR ? 2 : 3, requested * 50, (requested > floor ? floor : requested) * 50, rpn * 50);
+		}
+
 		// Only lower the floor AGPM asks for, so a lower request still works
 		if (requested > floor) {
-			if (self.gtFloorLogged != requested) {
-				self.gtFloorLogged = requested;
-				SYSLOG(log, "GT%u floor: AGPM requested %u MHz, using %u MHz (RPn %u MHz)",
-					   cmd == PMWORK_GT2_FLOOR ? 2 : 3, requested * 50, floor * 50, rpn * 50);
-			}
 			// Pass a copy: the argument points into the caller's stack frame
 			uint32_t value = floor;
 			return self.orgDoPMWork(controller, cmd, &value, arg2, arg3);
@@ -375,17 +406,32 @@ void IGFX::RPSControlPatch::logRC6(void *param0, void *) {
 	uint32_t events = __atomic_exchange_n(&self.rc6Events, 0, __ATOMIC_ACQUIRE);
 	uint32_t v0 = self.rc6LogValue[0], v1 = self.rc6LogValue[1], v2 = self.rc6LogValue[2];
 
-	if (events & RC6EventSnapshot)
+	if (events & RC6EventSnapshot) {
 		SYSLOG(log, "RC6: recorded the driver's RC6 configuration, RC_CONTROL 0x%08x PG_ENABLE 0x%08x", v0, v1);
-	if (events & RC6EventRestored)
+		self.publish("weg-rc6-control", v0);
+		self.publish("weg-rc6-status", "enabled");
+	}
+	if (events & RC6EventRestored) {
 		SYSLOG(log, "RC6: RC6 was disabled (RC_CONTROL 0x%08x), restored RC_CONTROL 0x%08x (attempt %u)", v0, v1, v2);
-	if (events & RC6EventGiveUp)
+		self.publish("weg-rc6-restores", ++self.rc6Restores);
+		self.publish("weg-rc6-status", "restored after it was disabled");
+	}
+	if (events & RC6EventGiveUp) {
 		SYSLOG(log, "RC6: the driver keeps RC6 disabled (RC_CONTROL 0x%08x), no more restores until RC6 is enabled again", v0);
-	if (events & RC6EventNever)
+		self.publish("weg-rc6-status", "driver keeps RC6 disabled, restores stopped");
+	}
+	if (events & RC6EventNever) {
 		SYSLOG(log, "RC6: the driver never enabled RC6 (RC_CONTROL 0x%08x), nothing to restore", v0);
-	if (events & RC6EventStall)
+		self.publish("weg-rc6-control", v0);
+		self.publish("weg-rc6-status", "never enabled by the driver");
+	}
+	if (events & RC6EventStall) {
 		SYSLOG(log, "RC6: RC6 is enabled but residency has not advanced for 60 s. Forcewake render ack 0x%08x media ack 0x%08x "
 			   "(bits held all the time mean a leaked forcewake reference keeps the GT out of RC6)", v0, v1);
+		self.publish("weg-rc6-forcewake-render", v0);
+		self.publish("weg-rc6-forcewake-media", v1);
+		self.publish("weg-rc6-status", "enabled but no residency for 60 s (forcewake held?)");
+	}
 }
 
 void IGFX::RPSControlPatch::checkRC6() {

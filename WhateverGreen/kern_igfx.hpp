@@ -1326,6 +1326,15 @@ private:
 		 */
 		uint32_t gtFloorCap {0};
 		uint32_t gtFloorLogged {0};
+
+		/**
+		 *  IGPU device: the RPS, RC6 and GT floor state is published there as weg-* properties, because early
+		 *  boot kernel log messages are often missing from the unified log
+		 */
+		IORegistryEntry *igpu {nullptr};
+		uint32_t rc6Restores {0};
+		void publish(const char *key, uint32_t value);
+		void publish(const char *key, const char *value);
 		IOReturn (*orgDoPMWork)(void *, uint32_t, void *, void *, void *) {nullptr};
 		static IOReturn wrapDoPMWork(void *controller, uint32_t cmd, void *arg1, void *arg2, void *arg3);
 
