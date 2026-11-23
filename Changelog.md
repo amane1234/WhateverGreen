@@ -2,6 +2,7 @@
 =======================
 #### v1.7.1
 - Added support for routing IOReg getProperty in other kexts
+- Fixed the backlight smoother fading the backlight off asynchronously during display/system sleep and raising it to `backlight-smoother-lowerbound` instead of turning it off
 
 #### v1.7.0
 - Added constants for macOS 26 support

@@ -1246,9 +1246,13 @@ bool BrightnessRequestEventSource::checkForWork() {
 	uint32_t current = IGFX::callbackIGFX->readRegister32(request.controller, request.address);
 	uint32_t cbrightness = request.getCurrentBrightness(current);
 	uint32_t tbrightness = request.getTargetBrightness();
-	tbrightness = max(tbrightness, smoother->brightnessRange.first);
-	tbrightness = min(tbrightness, smoother->brightnessRange.second);
-	tbrightness = min(tbrightness, request.mask); // Limit the brightness to the width of the duty field.
+	// Zero means "backlight off" (display or system sleep) and is honoured as is: raising it to the
+	// lower bound kept the backlight on. submitRequest() has already written it to the register.
+	if (tbrightness != 0) {
+		tbrightness = max(tbrightness, smoother->brightnessRange.first);
+		tbrightness = min(tbrightness, smoother->brightnessRange.second);
+		tbrightness = min(tbrightness, request.mask); // Limit the brightness to the width of the duty field.
+	}
 	uint32_t target = request.getTargetRegisterValue(tbrightness);
 
 	// A packed PWM register can change frequency while its duty field stays the same.
@@ -1422,13 +1426,25 @@ void IGFX::BacklightSmoother::processFramebufferKext(KernelPatcher &patcher, siz
 	}
 }
 
+void IGFX::BacklightSmoother::submitRequest(void *controller, uint32_t address, uint32_t value, uint32_t mask) {
+	auto &smoother = callbackIGFX->modBacklightSmoother;
+	BrightnessRequest request(smoother.request.id + 1, controller, address, value, mask);
+	if (request.getTargetBrightness() == 0) {
+		// Turning the backlight off (display or system sleep) is written right away. Fading it out on the
+		// workloop raced the panel power-off sequence, which then went on while PWM writes were still pending.
+		callbackIGFX->writeRegister32(controller, address, value);
+	}
+	// Still queue it: a fade in progress sees the new id and stops, and the event source finds it done.
+	smoother.request = request;
+	smoother.eventSource->enable();
+}
+
 void IGFX::BacklightSmoother::smoothIVBWriteRegisterPWMCCTRL(void *controller, uint32_t address, uint32_t value) {
 	DBGLOG("igfx", "BLS: [IVB ] WriteRegister32<BLC_PWM_CPU_CTL>: Called with register 0x%x and value 0x%x.", address, value);
 	PANIC_COND(address != BLC_PWM_CPU_CTL, "igfx", "Fatal Error: Register should be BLC_PWM_CPU_CTL.");
 	
 	// Submit the request and notify the event source
-	callbackIGFX->modBacklightSmoother.request = BrightnessRequest(callbackIGFX->modBacklightSmoother.request.id + 1, controller, address, value);
-	callbackIGFX->modBacklightSmoother.eventSource->enable();
+	submitRequest(controller, address, value, 0xFFFFFFFF);
 	DBGLOG("igfx", "BLS: [IVB ] WriteRegister32<BLC_PWM_CPU_CTL>: The brightness request has been submitted.");
 }
 
@@ -1437,8 +1453,7 @@ void IGFX::BacklightSmoother::smoothHSWWriteRegisterPWMFreq1(void *controller, u
 	PANIC_COND(address != BXT_BLC_PWM_FREQ1, "igfx", "Fatal Error: Register should be BXT_BLC_PWM_FREQ1.");
 	
 	// Submit the request and notify the event source
-	callbackIGFX->modBacklightSmoother.request = BrightnessRequest(callbackIGFX->modBacklightSmoother.request.id + 1, controller, address, value, 0xFFFF);
-	callbackIGFX->modBacklightSmoother.eventSource->enable();
+	submitRequest(controller, address, value, 0xFFFF);
 	DBGLOG("igfx", "BLS: [HSW+] WriteRegister32<BXT_BLC_PWM_FREQ1>: The brightness request has been submitted.");
 }
 
@@ -1447,7 +1462,6 @@ void IGFX::BacklightSmoother::smoothCFLWriteRegisterPWMDuty1(void *controller, u
 	PANIC_COND(address != BXT_BLC_PWM_DUTY1, "igfx", "Fatal Error: Register should be BXT_BLC_PWM_DUTY1.");
 	
 	// Submit the request and notify the event source
-	callbackIGFX->modBacklightSmoother.request = BrightnessRequest(callbackIGFX->modBacklightSmoother.request.id + 1, controller, address, value);
-	callbackIGFX->modBacklightSmoother.eventSource->enable();
+	submitRequest(controller, address, value, 0xFFFFFFFF);
 	DBGLOG("igfx", "BLS: [CFL+] WriteRegister32<BXT_BLC_PWM_DUTY1>: The brightness request has been submitted.");
 }

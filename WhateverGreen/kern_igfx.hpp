@@ -2253,6 +2253,11 @@ private:
 		 *
 		 *  @note When this function is called, `address` is guaranteed to be `BLC_PWM_CPU_CTL`.
 		 */
+		/**
+		 *  Queue a brightness request for the workloop; a request turning the backlight off is also written right away
+		 */
+		static void submitRequest(void *controller, uint32_t address, uint32_t value, uint32_t mask);
+
 		static void smoothIVBWriteRegisterPWMCCTRL(void *controller, uint32_t address, uint32_t value);
 
 		/**
