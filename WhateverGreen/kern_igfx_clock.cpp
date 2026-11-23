@@ -222,6 +222,10 @@ IOReturn IGFX::DPCDMaxLinkRateFix::wrapReadAUX(uint32_t address, void *buffer, u
 	if (address != DPCD_DEFAULT_RECEIVER_CAPS_ADDRESS && address != DPCD_EXTENDED_RECEIVER_CAPS_ADDRESS)
 		return retVal;
 
+	// Guard: Only touch a buffer that was actually read and is long enough to hold the field
+	if (retVal != kIOReturnSuccess || buffer == nullptr || length <= offsetof(DPCDCap16, maxLinkRate))
+		return retVal;
+
 	// The driver tries to read the first 16 bytes from DPCD (0x0000) or extended DPCD (0x2200)
 	// Get the current framebuffer index (An UInt32 field at 0x1dc in a framebuffer instance)
 	// We read the value of "IOFBDependentIndex" instead of accessing that field directly
@@ -247,10 +251,17 @@ IOReturn IGFX::DPCDMaxLinkRateFix::wrapReadAUX(uint32_t address, void *buffer, u
 		caps->maxLinkRate = callbackIGFX->modDPCDMaxLinkRateFix.maxLinkRate;
 	} else {
 		DBGLOG("igfx", "MLR: [COMM] wrapReadAUX() Will probe the maximum link rate from the table.");
-		caps->maxLinkRate = callbackIGFX->modDPCDMaxLinkRateFix.probeMaxLinkRate();
-		// The graphics driver tries to read the maximum link rate from both DPCD address 0x0 and 0x2200.
-		// We save the probe result to avoid duplicated computation.
-		callbackIGFX->modDPCDMaxLinkRateFix.maxLinkRate = caps->maxLinkRate;
+		auto probed = callbackIGFX->modDPCDMaxLinkRateFix.probeMaxLinkRate();
+		if (probed != 0) {
+			caps->maxLinkRate = probed;
+			// The graphics driver tries to read the maximum link rate from both DPCD address 0x0 and 0x2200.
+			// We save the probe result to avoid duplicated computation.
+			callbackIGFX->modDPCDMaxLinkRateFix.maxLinkRate = probed;
+		} else {
+			// The probe fails on every panel older than eDP 1.4. Writing its 0 over the value the panel
+			// reported turned a valid link rate into the very division by zero this fix is meant to prevent.
+			SYSLOG("igfx", "MLR: [COMM] wrapReadAUX() Could not probe the maximum link rate, keeping the reported value 0x%02x.", caps->maxLinkRate);
+		}
 	}
 	
 	// All done
@@ -509,6 +520,14 @@ void IGFX::CoreDisplayClockFix::processFramebufferKext(KernelPatcher &patcher, s
 }
 
 void IGFX::CoreDisplayClockFix::sanitizeCDClockFrequency(AppleIntelFramebufferController *that) {
+	// Guard: Both helpers must have been solved. The probe function can be routed while solving them failed,
+	// and calling a null function pointer here was a kernel panic.
+	if (callbackIGFX->modCoreDisplayClockFix.orgDisableCDClock == nullptr ||
+		callbackIGFX->modCoreDisplayClockFix.orgSetCDClockFrequency == nullptr) {
+		SYSLOG("igfx", "CDC: sanitizeCDClockFrequency() Error: Required functions are not available. Will not reprogram the clock.");
+		return;
+	}
+
 	// Read the hardware reference frequency from the DSSM register
 	// Bits 29-31 store the reference frequency value
 	auto referenceFrequency = callbackIGFX->readRegister32(that, ICL_REG_DSSM) >> 29;

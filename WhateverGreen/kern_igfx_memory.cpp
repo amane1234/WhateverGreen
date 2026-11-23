@@ -61,7 +61,9 @@ void IGFX::DVMTCalcFix::processKernel(KernelPatcher &patcher, DeviceInfo *info) 
 	} else if (gms >= 0xF0 && gms <= 0xFE) {
 		dvmt = ((gms & 0x0F) + 1) * 4;
 	} else {
-		SYSLOG("igfx", "DVMT: GMS value is reserved. Check your BIOS settings. DVMT will be set to 0.");
+		SYSLOG("igfx", "DVMT: GMS value 0x%02x is reserved. Check your BIOS settings. The fix has been disabled.", gms);
+		// Patching the driver with a DVMT of 0 bytes would leave the framebuffer without memory
+		enabled = false;
 		return;
 	}
 	
@@ -152,7 +154,8 @@ void IGFX::DVMTCalcFix::processFramebufferKext(KernelPatcher &patcher, size_t in
 		
 		// Instruction: shll $0x11, %???
 		// 3 bytes long if DSTReg < %r8d, otherwise 4 bytes long
-		if (handle.opcode == 0xC1 && handle.imm.imm8 == 0x11) {
+		// shl r/m32, 0x11 (C1 /4): /5 and /7 with the same immediate are shr/sar
+		if (handle.opcode == 0xC1 && handle.modrm_reg == 4 && handle.imm.imm8 == 0x11) {
 			shllAddr = startAddress;
 			shllSize = handle.len;
 			shllDstr = (handle.rex_b << 3) | handle.modrm_rm;
@@ -161,7 +164,8 @@ void IGFX::DVMTCalcFix::processFramebufferKext(KernelPatcher &patcher, size_t in
 		
 		// Instruction: andl $0xFE000000, %???
 		// 5 bytes long if DSTReg is %eax; 6 bytes long if DSTReg < %r8d; otherwise 7 bytes long.
-		if ((handle.opcode == 0x25 || handle.opcode == 0x81) && handle.imm.imm32 == 0xFE000000) {
+		// and eax, imm32 (25) or and r/m32, imm32 (81 /4): other 81 forms are add/or/sub/xor/cmp
+		if ((handle.opcode == 0x25 || (handle.opcode == 0x81 && handle.modrm_reg == 4)) && handle.imm.imm32 == 0xFE000000) {
 			andlAddr = startAddress;
 			andlSize = handle.len;
 			andlDstr = (handle.rex_b << 3) | handle.modrm_rm;
@@ -170,6 +174,15 @@ void IGFX::DVMTCalcFix::processFramebufferKext(KernelPatcher &patcher, size_t in
 		
 		// Guard: Calculate and apply the binary patch if we have found both instructions
 		if (shllAddr && andlAddr) {
+			// The opcode 25 form has no ModRM byte and always targets eax
+			if (*reinterpret_cast<uint8_t *>(andlAddr) == 0x25)
+				andlDstr = 0;
+			// Both instructions must work on the same register, otherwise this is not the calculation we expect
+			if (shllDstr != andlDstr) {
+				SYSLOG("igfx", "DVMT: shll (reg %u) and andl (reg %u) use different registers. Aborted patching.", shllDstr, andlDstr);
+				return;
+			}
+
 			// Update the `movl` instruction with the actual amount of DVMT preallocated memory
 			*reinterpret_cast<uint32_t*>(movl + 2) = dvmt;
 			
@@ -189,6 +202,12 @@ void IGFX::DVMTCalcFix::processFramebufferKext(KernelPatcher &patcher, size_t in
 				patchSize = andlDstr == 0 ? /* %eax */ 5 : /* others */ 6;
 			}
 			
+			// Guard: The replacement must fill exactly the andl instruction, and the nops must cover the shll one
+			if (patchSize != andlSize || shllSize > sizeof(nops)) {
+				SYSLOG("igfx", "DVMT: Unexpected instruction lengths (andl %u vs %u, shll %u). Aborted patching.", andlSize, patchSize, shllSize);
+				return;
+			}
+
 			// Guard: Prepare to apply the binary patch
 			if (MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS) {
 				SYSLOG("igfx", "DVMT: Failed to set kernel writing. Aborted patching.");

@@ -1632,15 +1632,22 @@ void IGFX::writePlatformListData(const char *subKeyName) {
 bool IGFX::applyPatch(const KernelPatcher::LookupPatch &patch, uint8_t *startingAddress, size_t maxSize) {
 	bool r = false;
 	size_t i = 0, patchCount = 0;
+
+	// Guard: Nothing to look for, or the pattern does not fit at all
+	if (patch.size == 0 || maxSize < patch.size || framebufferSize < patch.size)
+		return false;
+
+	// endAddress is the last position where the whole pattern still fits. The framebuffer bound used to
+	// be clamped without subtracting patch.size, so a match near its end read and wrote past the region.
 	uint8_t *startAddress = startingAddress;
 	uint8_t *endAddress = startingAddress + maxSize - patch.size;
 
 	if (startAddress < framebufferStart)
 		startAddress = framebufferStart;
-	if (endAddress > framebufferStart + framebufferSize)
-		endAddress = framebufferStart + framebufferSize;
+	if (endAddress > framebufferStart + framebufferSize - patch.size)
+		endAddress = framebufferStart + framebufferSize - patch.size;
 
-	while (startAddress < endAddress) {
+	while (startAddress <= endAddress) {
 		for (i = 0; i < patch.size; i++) {
 			if (startAddress[i] != patch.find[i])
 				break;
@@ -1925,13 +1932,21 @@ void IGFX::applyFramebufferPatches() {
 				platformInformationAddress = findFramebufferId(framebufferId, static_cast<uint8_t *>(gPlatformInformationList), PAGE_SIZE);
 			}
 
+			// Skipped patches release their data like applied ones (it used to leak)
+			auto dropPatch = [this, i]() {
+				OSSafeReleaseNULL(framebufferPatches[i].find);
+				OSSafeReleaseNULL(framebufferPatches[i].replace);
+			};
+
 			if (!platformInformationAddress) {
 				DBGLOG("igfx", "patch %lu framebufferId 0x%08X not found", i, framebufferId);
+				dropPatch();
 				continue;
 			}
 
 			if (framebufferPatches[i].find->getLength() != framebufferPatches[i].replace->getLength()) {
-				DBGLOG("igfx", "patch %lu framebufferId 0x%08X length mistmatch", i, framebufferId);
+				SYSLOG("igfx", "patch %lu framebufferId 0x%08X find and replace lengths differ, skipped", i, framebufferId);
+				dropPatch();
 				continue;
 			}
 

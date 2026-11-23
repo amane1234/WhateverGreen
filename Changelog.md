@@ -3,6 +3,12 @@
 #### v1.7.1
 - Added support for routing IOReg getProperty in other kexts
 - Fixed the backlight smoother fading the backlight off asynchronously during display/system sleep and raising it to `backlight-smoother-lowerbound` instead of turning it off
+- Fixed `-igfxmlr` overwriting a valid maximum link rate with 0 on panels older than eDP 1.4 (division by zero it is meant to prevent)
+- Fixed `-igfxmlr` modifying the DPCD buffer after a failed AUX read
+- Fixed `-igfxdvmt` patching a DVMT of 0 MB for reserved GMS values, matching shr/or instructions, and patching with mismatching registers or lengths
+- Fixed `-igfxcdc` calling unresolved functions when only the probe function could be routed
+- Fixed RPS control requesting the lowest GPU frequency while RP0 could not be read
+- Fixed framebuffer patches reading and writing past the framebuffer region and leaking skipped patch data
 
 #### v1.7.0
 - Added constants for macOS 26 support
