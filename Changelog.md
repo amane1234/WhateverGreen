@@ -9,6 +9,7 @@
 - Fixed `-igfxcdc` calling unresolved functions when only the probe function could be routed
 - Fixed RPS control requesting the lowest GPU frequency while RP0 could not be read
 - Fixed `igfxrpsc=1` pinning the GPU at its maximum frequency after S3/S4 sleep: the patch now boosts only under sustained load and otherwise keeps the driver's frequency (`igfxrpsc=2` restores the old always-maximum behaviour)
+- Added `igfxgtfloor=MHz` (`gt-floor-freq`) to lower the minimum GPU frequency AGPM sets with Apple GuC (`igfxfw=2`), e.g. back from 500 MHz to the hardware minimum
 - Added `-igfxrc6fix` (`enable-rc6-fix`) to restore the RC6 configuration when it is lost after S3/S4 sleep and to report a stuck RC6 residency (e.g. a leaked forcewake reference)
 - Fixed framebuffer patches reading and writing past the framebuffer region and leaking skipped patch data
 

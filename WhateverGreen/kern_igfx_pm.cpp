@@ -40,6 +40,7 @@
 #include <kern/thread_call.h>
 
 #include "kern_igfx.hpp"
+#include "kern_igfx_kexts.hpp"
 
 namespace {
 constexpr const char* log = "igfx_pm";
@@ -84,6 +85,13 @@ enum RC6Event : uint32_t {
 	RC6EventNever     = 1U << 3,
 	RC6EventStall     = 1U << 4,
 };
+
+/**
+ *  AppleIntelFramebufferController::doPMWork commands that set the minimum GPU frequency (GuC mode),
+ *  sent from AGPM attributes ' g2f' and ' g3f'. The argument points to the floor in 50 MHz units.
+ */
+constexpr uint32_t PMWORK_GT2_FLOOR = 6;
+constexpr uint32_t PMWORK_GT3_FLOOR = 7;
 
 constexpr uint32_t GEN9_FREQUENCY_SHIFT = 23;
 constexpr uint32_t GEN9_FREQ_SCALER  = 3;
@@ -194,17 +202,80 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 
 	// Submissions closer together than this mean the GPU is under sustained load
 	nanoseconds_to_absolutetime(8 * 1000 * 1000, &busyInterval);
+
+	// With Apple GuC (igfxfw=2) AGPM sets a minimum frequency (e.g. 500 MHz) that the host driver ignores
+	// otherwise. igfxgtfloor=MHz caps it; any value at or below the hardware minimum (RPn) gives RPn.
+	uint32_t floorMHz = 0;
+	if (available && (PE_parse_boot_argn("igfxgtfloor", &floorMHz, sizeof(floorMHz)) ||
+		WIOKit::getOSDataValue(info->videoBuiltin, "gt-floor-freq", floorMHz)) && floorMHz > 0) {
+		gtFloorCap = (floorMHz + 49) / 50;
+		enabled = true;
+		SYSLOG(log, "GT floor capped at %u MHz", gtFloorCap * 50);
+	}
 }
 
 void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-	KernelPatcher::RouteRequest routeRequest = {
-		"__ZL15pmNotifyWrapperjjPyPj",
-		wrapPmNotifyWrapper,
-		orgPmNotifyWrapper
-	};
-	
-	if (!patcher.routeMultiple(index, &routeRequest, 1, address, size))
-		SYSLOG(log, "Failed to route pmNotifyWrapper.");
+	if (mode != 0 || rc6Fix) {
+		KernelPatcher::RouteRequest routeRequest = {
+			"__ZL15pmNotifyWrapperjjPyPj",
+			wrapPmNotifyWrapper,
+			orgPmNotifyWrapper
+		};
+
+		if (!patcher.routeMultiple(index, &routeRequest, 1, address, size))
+			SYSLOG(log, "Failed to route pmNotifyWrapper.");
+	}
+
+	// The doPMWork command numbers were verified on the KBL framebuffer only
+	if (gtFloorCap && callbackIGFX->getRealFramebuffer(index) != &kextIntelKBLFb) {
+		SYSLOG(log, "GT floor cap is only supported with the KBL framebuffer, disabled.");
+		gtFloorCap = 0;
+	}
+
+	if (gtFloorCap) {
+		KernelPatcher::RouteRequest routeRequest = {
+			"__ZN31AppleIntelFramebufferController8doPMWorkEjPvS0_S0_",
+			wrapDoPMWork,
+			orgDoPMWork
+		};
+
+		if (!patcher.routeMultiple(index, &routeRequest, 1, address, size)) {
+			SYSLOG(log, "Failed to route doPMWork, GT floor cap disabled.");
+			gtFloorCap = 0;
+		}
+	}
+}
+
+IOReturn IGFX::RPSControlPatch::wrapDoPMWork(void *controller, uint32_t cmd, void *arg1, void *arg2, void *arg3) {
+	auto &self = callbackIGFX->modRPSControlPatch;
+
+	if ((cmd == PMWORK_GT2_FLOOR || cmd == PMWORK_GT3_FLOOR) && arg1 && self.gtFloorCap) {
+		uint32_t requested = *static_cast<uint32_t *>(arg1);
+
+		// Never go below the hardware minimum (RPn) or above the maximum (RP0)
+		uint32_t cap = callbackIGFX->readRegister32(controller, GEN6_RP_STATE_CAP);
+		uint32_t rp0 = cap & 0xFF;
+		uint32_t rpn = (cap >> 16) & 0xFF;
+		uint32_t floor = self.gtFloorCap;
+		if (floor < rpn)
+			floor = rpn;
+		if (rp0 && floor > rp0)
+			floor = rp0;
+
+		// Only lower the floor AGPM asks for, so a lower request still works
+		if (requested > floor) {
+			if (self.gtFloorLogged != requested) {
+				self.gtFloorLogged = requested;
+				SYSLOG(log, "GT%u floor: AGPM requested %u MHz, using %u MHz (RPn %u MHz)",
+					   cmd == PMWORK_GT2_FLOOR ? 2 : 3, requested * 50, floor * 50, rpn * 50);
+			}
+			// Pass a copy: the argument points into the caller's stack frame
+			uint32_t value = floor;
+			return self.orgDoPMWork(controller, cmd, &value, arg2, arg3);
+		}
+	}
+
+	return self.orgDoPMWork(controller, cmd, arg1, arg2, arg3);
 }
 
 void IGFX::RPSControlPatch::processGraphicsKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -237,7 +308,8 @@ int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1,
 	if (self.mode == 0) {
 		// RC6 monitor only
 		int ret = self.orgPmNotifyWrapper(a0, a1, a2, freq);
-		self.checkRC6();
+		if (self.rc6Fix)
+			self.checkRC6();
 		return ret;
 	}
 

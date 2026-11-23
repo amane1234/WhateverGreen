@@ -1319,6 +1319,16 @@ private:
 		uint32_t rc6Events {0};
 		uint32_t rc6LogValue[3] {};
 		void checkRC6();
+
+		/**
+		 *  igfxgtfloor: cap for the GPU minimum frequency (in 50 MHz units) that AGPM requests in GuC mode
+		 *  through doPMWork (kIOAGPMGT2Floor / kIOAGPMGT3Floor), 0 when disabled
+		 */
+		uint32_t gtFloorCap {0};
+		uint32_t gtFloorLogged {0};
+		IOReturn (*orgDoPMWork)(void *, uint32_t, void *, void *, void *) {nullptr};
+		static IOReturn wrapDoPMWork(void *controller, uint32_t cmd, void *arg1, void *arg2, void *arg3);
+
 		void postRC6Event(uint32_t event, uint32_t v0, uint32_t v1 = 0, uint32_t v2 = 0);
 		static void logRC6(void *param0, void *param1);
 
