@@ -96,6 +96,13 @@ constexpr uint32_t PMWORK_GT3_FLOOR = 7;
 constexpr uint32_t GEN9_FREQUENCY_SHIFT = 23;
 constexpr uint32_t GEN9_FREQ_SCALER  = 3;
 
+/**
+ *  pmNotifyWrapper frequency request (GEN6_RPNSWREQ format) for a frequency in 50 MHz units
+ */
+constexpr uint32_t rpsRequest(uint32_t freq) {
+	return (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * freq;
+}
+
 constexpr uint32_t FORCEWAKE_KERNEL_FALLBACK = 1 << 15;
 
 constexpr uint32_t FORCEWAKE_ACK_TIMEOUT_MS = 50;
@@ -195,8 +202,33 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 	if (PE_parse_boot_argn("igfxrpsc", &rpsc, sizeof(rpsc)) ||
 		WIOKit::getOSDataValue(info->videoBuiltin, "rps-control", rpsc)) {
 		enabled = rpsc > 0 && available;
-		mode = rpsc == 0 ? 0 : (rpsc >= 2 ? 2 : 1);
-		DBGLOG("weg", "RPS control patch overriden (%u) availabile %d", rpsc, available);
+		mode = !enabled ? 0 : (rpsc >= 2 ? 2 : 1);
+		DBGLOG("weg", "RPS control patch overridden (%u) available %d", rpsc, available);
+	}
+
+	nanoseconds_to_absolutetime(1000ULL * 1000 * 1000, &reportInterval);
+
+	// Submissions closer together than this mean the GPU is busy
+	nanoseconds_to_absolutetime(8 * 1000 * 1000, &busyInterval);
+
+	if (mode == 1) {
+		// The GPU has to stay busy this long before boosting, so short bursts (a UI animation frame, a render and
+		// a blit submitted together) keep the driver's frequency. 0 boosts from the second busy submission.
+		uint32_t delayMs = 32;
+		if (!PE_parse_boot_argn("igfxrpscdelay", &delayMs, sizeof(delayMs)))
+			WIOKit::getOSDataValue(info->videoBuiltin, "rps-control-delay", delayMs);
+		if (delayMs > 1000)
+			delayMs = 1000;
+		nanoseconds_to_absolutetime(delayMs * 1000ULL * 1000, &boostDelay);
+		SYSLOG(log, "RPS control: boosting after %u ms of sustained load", delayMs);
+		publish("weg-rps-boost-delay", delayMs);
+	}
+
+	if (mode != 0) {
+		rpsReportCall = thread_call_allocate(reinterpret_cast<thread_call_func_t>(reportRPS), this);
+		if (!rpsReportCall)
+			SYSLOG(log, "Failed to allocate the RPS report call, RP0 and boosts are not published");
+		publish("weg-rps-status", "waiting for GPU submissions");
 	}
 
 	// The RC6 monitor runs in the same pmNotifyWrapper hook, with or without RPS control
@@ -214,9 +246,6 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 			SYSLOG(log, "Failed to allocate the RC6 monitor log call");
 		}
 	}
-
-	// Submissions closer together than this mean the GPU is under sustained load
-	nanoseconds_to_absolutetime(8 * 1000 * 1000, &busyInterval);
 
 	// With Apple GuC (igfxfw=2) AGPM sets a minimum frequency (e.g. 500 MHz) that the host driver ignores
 	// otherwise. igfxgtfloor=MHz caps it; any value at or below the hardware minimum (RPn) gives RPn.
@@ -245,8 +274,12 @@ void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_
 			orgPmNotifyWrapper
 		};
 
-		if (!patcher.routeMultiple(index, &routeRequest, 1, address, size))
+		if (!patcher.routeMultiple(index, &routeRequest, 1, address, size)) {
 			SYSLOG(log, "Failed to route pmNotifyWrapper.");
+			notifyRouted = false;
+			if (mode != 0)
+				publish("weg-rps-status", "disabled: pmNotifyWrapper not found");
+		}
 	}
 
 	// The doPMWork command numbers were verified on the KBL and CFL framebuffers only
@@ -315,23 +348,35 @@ void IGFX::RPSControlPatch::processGraphicsKext(KernelPatcher &patcher, size_t i
 	if (mode == 0)
 		return;
 
+	// Without the pmNotifyWrapper wrapper (framebuffer processed first), the other streamers would only send
+	// the driver's own requests
+	if (!notifyRouted) {
+		publish("weg-rps-engines", "none: pmNotifyWrapper not routed");
+		return;
+	}
+
 	// Address of `IGHardwareCommandStreamer2::submitExecList`
-	mach_vm_address_t orgSubmitExecList;
-	
+	mach_vm_address_t orgSubmitExecList {0};
+
 	KernelPatcher::SolveRequest request = {
 		getKernelVersion() >= KernelVersion::Catalina ? "__ZN26IGHardwareCommandStreamer514submitExecListEj" : "__ZN26IGHardwareCommandStreamer214submitExecListEj",
 		orgSubmitExecList
 	};
-	
+
 	if (!patcher.solveMultiple(index, &request, 1, address, size)) {
 		SYSLOG(log, "Failed to solve the symbol for submitExecList.");
+		publish("weg-rps-engines", "render only: submitExecList not found");
 		return;
 	}
-	
+
 	// `submitExecList()` only controls RPS for RCS type streamers
 	// Patch it to enable control for any kind of streamer
-	if (!patchRCSCheck(orgSubmitExecList))
+	if (patchRCSCheck(orgSubmitExecList)) {
+		publish("weg-rps-engines", "all");
+	} else {
 		SYSLOG(log, "Failed to patch RCS check.");
+		publish("weg-rps-engines", "render only: streamer check not patched");
+	}
 }
 
 int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1, unsigned long long *a2, unsigned int *freq) {
@@ -356,40 +401,107 @@ int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1,
 		uint32_t cfreq = 0;
 		self.orgPmNotifyWrapper(a0, a1, a2, &cfreq);
 
-		if (!self.freq_max) {
-			self.freq_max = callbackIGFX->readRegister32(callbackIGFX->defaultController(), GEN6_RP_STATE_CAP) & 0xFF;
-			DBGLOG(log, "Read RP0 %d", self.freq_max);
-		}
-
 		// Without RP0 (register not readable yet) keep the frequency the driver asked for: 0 would request
 		// the lowest frequency instead of the highest one
-		*freq = self.freq_max ? (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * self.freq_max : cfreq;
+		*freq = self.readFrequencyCaps() ? rpsRequest(self.freq_max) : cfreq;
 		return 0;
 	}
 
-	// Adaptive mode: let the driver (AGPM) pick the frequency, and only boost to RP0 while submissions
-	// arrive back to back. Every request used to be RP0, so the frequency only dropped through RC6.
-	// After S3/S4 sleep, the GPU was then pinned at the maximum clock. Now the next light submission
-	// (cursor, compositor) restores the driver's own choice.
+	// Adaptive mode: let the driver (AGPM) pick the frequency, and only boost to RP0 once submissions have kept
+	// arriving back to back for boostDelay (sustained load). Every request used to be RP0, so the frequency only
+	// dropped through RC6. After S3/S4 sleep, the GPU was then pinned at the maximum clock. Now the next light
+	// submission (cursor, compositor) restores the driver's own choice.
 	int ret = self.orgPmNotifyWrapper(a0, a1, a2, freq);
+	if (ret == 0)
+		__atomic_store_n(&self.driverFreq, *freq, __ATOMIC_RELAXED);
 
 	uint64_t now = mach_absolute_time();
 	uint64_t last = __atomic_exchange_n(&self.lastNotify, now, __ATOMIC_RELAXED);
-	// last > now: the timestamp came from another CPU a moment ago, treat it as busy
-	bool busy = last != 0 && (now < last || now - last <= self.busyInterval);
-	if (!busy)
-		return ret;
+	// last > now: the timestamp came from another CPU a moment ago, it belongs to the same run
+	bool gap = last == 0 || (now > last && now - last > self.busyInterval);
+	if (gap)
+		__atomic_store_n(&self.busySince, now, __ATOMIC_RELAXED);
+	uint64_t since = __atomic_load_n(&self.busySince, __ATOMIC_RELAXED);
+	bool sustained = !gap && now >= since && now - since >= self.boostDelay;
 
-	if (!self.freq_max) {
-		self.freq_max = callbackIGFX->readRegister32(callbackIGFX->defaultController(), GEN6_RP_STATE_CAP) & 0xFF;
-		DBGLOG(log, "Read RP0 %d", self.freq_max);
+	if (!sustained || !self.readFrequencyCaps()) {
+		// The GPU still runs at the boosted RP0 request. If the driver made no request of its own this time,
+		// repeat its last one, so the boost does not outlast the load.
+		if (__atomic_exchange_n(&self.boosting, false, __ATOMIC_RELAXED) && ret != 0) {
+			uint32_t dfreq = __atomic_load_n(&self.driverFreq, __ATOMIC_RELAXED);
+			if (dfreq != 0) {
+				*freq = dfreq;
+				return 0;
+			}
+		}
+		return ret;
 	}
 
-	if (self.freq_max == 0)
-		return ret;
+	if (!__atomic_exchange_n(&self.boosting, true, __ATOMIC_RELAXED)) {
+		__atomic_fetch_add(&self.boostCount, 1, __ATOMIC_RELAXED);
+		self.scheduleRPSReport();
+	}
 
-	*freq = (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * self.freq_max;
+	*freq = rpsRequest(self.freq_max);
 	return 0;
+}
+
+bool IGFX::RPSControlPatch::readFrequencyCaps() {
+	if (__atomic_load_n(&freq_max, __ATOMIC_ACQUIRE) != 0)
+		return true;
+
+	auto controller = callbackIGFX->defaultController();
+	if (!controller)
+		return false;
+
+	// RP_STATE_CAP: RP0 in bits 7:0 and RPn in bits 23:16 (50 MHz units).
+	// 0 (not readable yet) and all ones (device not accessible) are retried at the next submission:
+	// all ones used to be kept as a 12.75 GHz RP0 for the rest of the session.
+	uint32_t cap = callbackIGFX->readRegister32(controller, GEN6_RP_STATE_CAP);
+	uint32_t rp0 = cap & 0xFF;
+	uint32_t rpn = (cap >> 16) & 0xFF;
+	if (cap == 0xFFFFFFFF || rp0 == 0 || rp0 < rpn)
+		return false;
+
+	// freq_min first: readers check freq_max
+	__atomic_store_n(&freq_min, rpn, __ATOMIC_RELAXED);
+	uint32_t expected = 0;
+	if (__atomic_compare_exchange_n(&freq_max, &expected, rp0, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+		scheduleRPSReport();
+	return true;
+}
+
+void IGFX::RPSControlPatch::scheduleRPSReport() {
+	// Called from the submission path, which may run in interrupt context: publish from a thread call,
+	// at most once per reportInterval. The report reads the latest values when it runs.
+	if (!rpsReportCall || __atomic_exchange_n(&rpsReportArmed, true, __ATOMIC_ACQ_REL))
+		return;
+	thread_call_enter_delayed(static_cast<thread_call_t>(rpsReportCall), mach_absolute_time() + reportInterval);
+}
+
+void IGFX::RPSControlPatch::reportRPS(void *param0, void *) {
+	auto &self = *static_cast<RPSControlPatch *>(param0);
+	__atomic_store_n(&self.rpsReportArmed, false, __ATOMIC_RELEASE);
+
+	uint32_t rp0 = __atomic_load_n(&self.freq_max, __ATOMIC_ACQUIRE);
+	if (rp0 != 0 && !self.capsReported) {
+		self.capsReported = true;
+		uint32_t rpn = __atomic_load_n(&self.freq_min, __ATOMIC_RELAXED);
+		SYSLOG(log, "RPS control: RP0 %u MHz, RPn %u MHz", rp0 * 50, rpn * 50);
+		self.publish("weg-rps-rp0", rp0 * 50);
+		self.publish("weg-rps-rpn", rpn * 50);
+		self.publish("weg-rps-status", self.mode == 2 ? "always requesting RP0" : "boosting to RP0 under sustained load");
+	}
+
+	if (self.mode == 1) {
+		uint32_t boosts = __atomic_load_n(&self.boostCount, __ATOMIC_RELAXED);
+		if (boosts != self.boostsReported) {
+			if (self.boostsReported == 0)
+				SYSLOG(log, "RPS control: first boost to RP0 (%u MHz)", rp0 * 50);
+			self.boostsReported = boosts;
+			self.publish("weg-rps-boosts", boosts);
+		}
+	}
 }
 
 void IGFX::RPSControlPatch::postRC6Event(uint32_t event, uint32_t v0, uint32_t v1, uint32_t v2) {
@@ -524,50 +636,70 @@ void IGFX::RPSControlPatch::checkRC6() {
 	postRC6Event(RC6EventRestored, rcControl, rc6Snapshot[controlIndex], rc6FailedRestores + 1);
 }
 
-bool IGFX::RPSControlPatch::patchRCSCheck(mach_vm_address_t& start) {
+bool IGFX::RPSControlPatch::patchRCSCheck(mach_vm_address_t start) {
 	constexpr unsigned ninsts_max {256};
-	
+
+	// The streamer type check is `cmp byte ptr [rcx], 0` (IGHwCsDesc::type, 0 is RCS) followed by the
+	// `jnz rel32` that skips the RPS request for the other streamers. Only that jump is removed: the first
+	// conditional jump after the compare has to be a 6-byte jnz within a few instructions, otherwise the code
+	// is not the expected one and nothing is patched (a later, unrelated jnz used to be patched instead).
+	constexpr unsigned jnz_distance_max {4};
+
 	hde64s dis;
-	
 	bool found_cmp = false;
 	bool found_jmp = false;
+	size_t cmp_index = 0;
 
 	for (size_t i = 0; i < ninsts_max; i++) {
 		auto sz = Disassembler::hdeDisasm(start, &dis);
 
 		if (dis.flags & F_ERROR) {
 			SYSLOG(log, "Error disassembling submitExecList");
-			break;
+			return false;
 		}
 
-		/* cmp byte ptr [rcx], 0 */
-		if (!found_cmp && dis.opcode == 0x80 && dis.modrm_reg == 7 && dis.modrm_rm == 1)
-			found_cmp = true;
-		/* jnz rel32 */
-		if (found_cmp && dis.opcode == 0x0f && dis.opcode2 == 0x85) {
-			found_jmp = true;
-			break;
+		if (!found_cmp) {
+			/* cmp byte ptr [rcx], 0 */
+			if (dis.opcode == 0x80 && dis.modrm_mod == 0 && dis.modrm_reg == 7 && dis.modrm_rm == 1 &&
+				!dis.rex_b && !dis.p_67 && dis.imm.imm8 == 0) {
+				found_cmp = true;
+				cmp_index = i;
+			}
+		} else {
+			bool jcc8 = (dis.opcode & 0xF0) == 0x70;
+			bool jcc32 = dis.opcode == 0x0F && (dis.opcode2 & 0xF0) == 0x80;
+
+			/* jnz rel32 */
+			if (jcc32 && dis.opcode2 == 0x85 && sz == 6) {
+				found_jmp = true;
+				break;
+			}
+
+			if (jcc8 || jcc32 || i - cmp_index > jnz_distance_max) {
+				SYSLOG(log, "Unexpected code after the RCS check in submitExecList (opcode 0x%02X 0x%02X)", dis.opcode, dis.opcode2);
+				return false;
+			}
 		}
 
 		start += sz;
 	}
-	
-	if (found_jmp) {
-		auto status = MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock);
-		if (status == KERN_SUCCESS) {
-			constexpr uint8_t nop6[] {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
-			lilu_os_memcpy(reinterpret_cast<void*>(start), nop6, arrsize(nop6));
-			MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-			DBGLOG(log, "Patched submitExecList");
-			return true;
-		} else {
-			DBGLOG(log, "Failed to set kernel writing");
-			return false;
-		}
-	} else {
-		SYSLOG(log, "jnz in submitExecList not found");
+
+	if (!found_jmp) {
+		SYSLOG(log, "RCS check in submitExecList not found (cmp %d)", found_cmp);
 		return false;
 	}
+
+	auto status = MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock);
+	if (status != KERN_SUCCESS) {
+		SYSLOG(log, "Failed to set kernel writing");
+		return false;
+	}
+
+	constexpr uint8_t nop6[] {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+	lilu_os_memcpy(reinterpret_cast<void*>(start), nop6, arrsize(nop6));
+	MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+	DBGLOG(log, "Patched submitExecList");
+	return true;
 }
 
 // MARK: - Force Wake Workaround

@@ -1283,19 +1283,54 @@ private:
 	 *  A submodule that patches RPS control for all command streamers
 	 */
 	class RPSControlPatch: public PatchSubmodule {
+		/**
+		 *  RP0 (maximum) and RPn (minimum) GPU frequencies in 50 MHz units from GEN6_RP_STATE_CAP, 0 until read
+		 */
 		uint32_t freq_max {0};
+		uint32_t freq_min {0};
 
 		/**
-		 *  rps-control mode: 1 boosts to RP0 only while command submissions arrive back to back (busy GPU),
-		 *  2 always requests RP0 (legacy behaviour)
+		 *  Read and validate RP0/RPn once. Returns false while RP0 is not known.
+		 */
+		bool readFrequencyCaps();
+
+		/**
+		 *  rps-control mode: 1 boosts to RP0 only under sustained load (busy GPU), 2 always requests RP0 (legacy behaviour)
 		 */
 		uint32_t mode {0};
 
 		/**
-		 *  Time of the previous submission notification and the maximum gap that still counts as busy
+		 *  Adaptive mode load tracking: time of the previous submission notification, start of the current run of
+		 *  submissions at most busyInterval apart, and how long such a run must last before boosting (igfxrpscdelay)
 		 */
 		uint64_t lastNotify {0};
+		uint64_t busySince {0};
 		uint64_t busyInterval {0};
+		uint64_t boostDelay {0};
+
+		/**
+		 *  Adaptive mode: true while the last request was a boost, the last frequency request made by the driver itself
+		 *  (restored once the load ends), and the number of boost periods
+		 */
+		bool boosting {false};
+		uint32_t driverFreq {0};
+		uint32_t boostCount {0};
+		uint32_t boostsReported {0};
+		bool capsReported {false};
+
+		/**
+		 *  RPS state reporting from the submission path, at most once per reportInterval
+		 */
+		void *rpsReportCall {nullptr};
+		bool rpsReportArmed {false};
+		uint64_t reportInterval {0};
+		void scheduleRPSReport();
+		static void reportRPS(void *param0, void *param1);
+
+		/**
+		 *  False when pmNotifyWrapper could not be routed: the streamer check is then left alone
+		 */
+		bool notifyRouted {true};
 
 		/**
 		 *  RC6 monitor (-igfxrc6fix): records the RC6 configuration the driver programmed and restores it
@@ -1341,7 +1376,7 @@ private:
 		void postRC6Event(uint32_t event, uint32_t v0, uint32_t v1 = 0, uint32_t v2 = 0);
 		static void logRC6(void *param0, void *param1);
 
-		bool patchRCSCheck(mach_vm_address_t& start);
+		bool patchRCSCheck(mach_vm_address_t start);
 		int (*orgPmNotifyWrapper)(unsigned int, unsigned int, unsigned long long *, unsigned int *) {nullptr};
 		static int wrapPmNotifyWrapper(unsigned int, unsigned int, unsigned long long *, unsigned int *);
 		

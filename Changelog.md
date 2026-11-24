@@ -9,6 +9,11 @@
 - Fixed `-igfxcdc` calling unresolved functions when only the probe function could be routed
 - Fixed RPS control requesting the lowest GPU frequency while RP0 could not be read
 - Fixed `igfxrpsc=1` pinning the GPU at its maximum frequency after S3/S4 sleep: the patch now boosts only under sustained load and otherwise keeps the driver's frequency (`igfxrpsc=2` restores the old always-maximum behaviour)
+- Fixed `igfxrpsc=1` boosting on ordinary desktop frames (a render and a blit submitted together counted as load): boosting now needs `igfxrpscdelay` ms (`rps-control-delay`, default 32) of sustained load
+- Fixed `igfxrpsc=1` leaving the boost request in place after the load ended when the driver made no request of its own
+- Fixed RPS control keeping an unreadable RP_STATE_CAP (all ones) as a 12.75 GHz RP0
+- Fixed the RPS streamer patch removing an unrelated `jnz` in `submitExecList` when the expected RCS check was not found
+- Added `weg-rps-*` IGPU properties reporting the RPS control state (RP0/RPn, boost count, patched streamers)
 - Added `igfxgtfloor=MHz` (`gt-floor-freq`) to lower the minimum GPU frequency AGPM sets with Apple GuC (`igfxfw=2`), e.g. back from 500 MHz to the hardware minimum
 - Added `-igfxrc6fix` (`enable-rc6-fix`) to restore the RC6 configuration when it is lost after S3/S4 sleep and to report a stuck RC6 residency (e.g. a leaked forcewake reference)
 - Fixed framebuffer patches reading and writing past the framebuffer region and leaking skipped patch data
