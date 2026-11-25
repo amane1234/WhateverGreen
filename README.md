@@ -184,7 +184,7 @@ This `experimental` branch is `master` plus an **experimental** Intel graphics p
 | PSR off | `16` | Clears the enable bit from the framebuffer's PSR1/PSR2 control writes, so PSR is never entered. |
 | DC5 limit | `32` | Writes a DC6 request as DC5. |
 | DC off | `64` | Clears DC5/DC6 from DC state writes (overrides `32`). |
-| Dynamic FBC | `256` | Adds `FBDynamicFBCEnable` (0x10) on its own. Combine with `2` for both, as bit `2` did before. Kept separate so a panic can be traced to FBC or to dynamic FBC. |
+| Dynamic FBC | `256` | Adds `FBDynamicFBCEnable` (0x10) on its own. **Known problem:** in testing it caused a kernel panic, while FBC alone (`2`) worked. Do not use it unless you are investigating that panic. |
 | Native modeset | `128` | Turns off WhateverGreen's forced complete modeset so the Apple driver decides when one is needed, like `igfxfcms=0` (an explicit `igfxfcms` or `complete-modeset` wins). |
 
 An enabled explicit `framebuffer-flags` patch takes precedence over bits `2`, `4` and `256`. Bits `16`, `32` and `64` only lower what Apple's driver requests: they cannot enable PSR or a deeper DC state the driver did not ask for. Turning PSR or DC states off normally costs power; it is meant for A/B baselines and for finding the cause of flicker, wake or black-screen problems. Full details: [Manual/IntelPowerExperiments.md](./Manual/IntelPowerExperiments.md).
@@ -202,7 +202,7 @@ An enabled explicit `framebuffer-flags` patch takes precedence over bits `2`, `4
    `weg-power-rc6-permille` is the share of the last window spent in GT RC6 (900 = 90%), `weg-power-window-ms` the window length and `weg-power-status` whether the window was valid. A fully idle GPU may leave an old sample visible.
 4. Then test **one** policy change per boot, comparing with the `igfxpwr=1` readings:
    - `igfxpwr=3`: FBC only (check that `weg-power-framebuffer-matched` is `1` and `weg-power-framebuffer-flags` has 0x4)
-   - `igfxpwr=257`: dynamic FBC only; `igfxpwr=259`: both. If FBC panics, try these separately to see which flag causes it. FBC places its compressed buffer in the iGPU's stolen memory (BIOS DVMT pre-allocated), so a panic can also mean that memory is too small
+   - `igfxpwr=257` (dynamic FBC only) or `259` (both): **caused a kernel panic in testing** while `igfxpwr=3` (FBC only) worked. Use bit `2` without `256`. Try `257` only to investigate the panic, with a bootable fallback EFI
    - `igfxpwr=5`: dynamic CDCLK
    - `igfxpwr=9 igfxrpsc=1`: EPP-aware boost (`weg-power-hwp-epp`, `weg-power-defer-rp0`, `weg-power-boost-bias`)
    - `igfxpwr=17`: PSR off (`weg-power-psr1-writes-cleared`, `weg-power-psr2-writes-cleared` count the changed writes)

@@ -6,7 +6,7 @@ These boot arguments target a display-connected Kaby Lake, Coffee Lake or Comet 
 | --- | --- |
 | `igfxpwr=1` | Collect RC6 residency, observed ForceWake requests, and display registers already read by the Apple framebuffer. No new timer. |
 | `igfxpwr=3` | Diagnostics plus a request for native FBC (`0x4`). |
-| `igfxpwr=257` | Diagnostics plus a request for dynamic FBC (`0x10`) only. Use `igfxpwr=259` for both. |
+| `igfxpwr=257` | Diagnostics plus a request for dynamic FBC (`0x10`) only. **Known to cause a kernel panic in testing**; FBC alone (`igfxpwr=3`) worked. Use only to investigate it. |
 | `igfxpwr=5` | Diagnostics plus a request for native dynamic CDCLK. |
 | `igfxpwr=9 igfxrpsc=1` | Diagnostics plus an HWP-aware limit on WhateverGreen's adaptive RP0 boost. |
 | `igfxpwr=17` | Diagnostics plus PSR off: the enable bit is cleared from the framebuffer's PSR1/PSR2 control writes. |
@@ -15,7 +15,7 @@ These boot arguments target a display-connected Kaby Lake, Coffee Lake or Comet 
 | `igfxpwr=129` | Diagnostics plus native modeset: WhateverGreen's forced complete modeset is turned off so the Apple driver decides. |
 | `igfxfcms=0` | Existing independent option with the same modeset effect; `igfxfcms` and `complete-modeset` take precedence over `igfxpwr=128`. |
 
-The decimal mask accepts bits 1 (observe), 2 (FBC), 4 (CDCLK), 8 (EPP, includes observation), 16 (PSR off), 32 (DC5 limit), 64 (DC5/DC6 off), 128 (native modeset) and 256 (dynamic FBC). Bit 2 used to set FBC and dynamic FBC together; they are separate now so a panic can be traced to one of them. FBC keeps its compressed buffer in the iGPU's stolen memory (BIOS DVMT pre-allocated); if that is smaller than the platform entry expects, the buffer can land outside it. Values 2 and 4 can be used without diagnostics. Try one policy change per boot. The display options merge flags into the selected platform entry only; an explicit enabled `framebuffer-flags` patch takes precedence. The Apple controller publishes `weg-power-framebuffer-flags` when a matching entry is found. Existing platform capabilities, panel support, and driver policy still apply. CDCLK additionally depends on Apple's `SupportDynamicCDClk=1` and `dc6config=3`. This experiment manipulates neither PLLs nor display watermarks.
+The decimal mask accepts bits 1 (observe), 2 (FBC), 4 (CDCLK), 8 (EPP, includes observation), 16 (PSR off), 32 (DC5 limit), 64 (DC5/DC6 off), 128 (native modeset) and 256 (dynamic FBC). Bit 2 used to set FBC and dynamic FBC together; they are separate now because the combination panicked. Testing traced the panic to dynamic FBC (bit 256): FBC alone (bit 2) worked. Dynamic FBC lets the Apple driver switch compression on and off at runtime; why that panics on these machines is not known yet (a panic log would show where). FBC keeps its compressed buffer in the iGPU's stolen memory (BIOS DVMT pre-allocated); if that is smaller than the platform entry expects, the buffer can land outside it. Values 2 and 4 can be used without diagnostics. Try one policy change per boot. The display options merge flags into the selected platform entry only; an explicit enabled `framebuffer-flags` patch takes precedence. The Apple controller publishes `weg-power-framebuffer-flags` when a matching entry is found. Existing platform capabilities, panel support, and driver policy still apply. CDCLK additionally depends on Apple's `SupportDynamicCDClk=1` and `dc6config=3`. This experiment manipulates neither PLLs nor display watermarks.
 
 ## Reading a sample
 
