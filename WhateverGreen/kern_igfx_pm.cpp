@@ -212,7 +212,9 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 	}
 	if (displayPolicy)
 		enabled = true;
-	requiresMMIORegistersWriteAccess = rc6Fix || displayPolicy;
+	// Only ever set here, as on master: without -igfxrc6fix or an igfxpwr display policy nothing changes
+	if (rc6Fix || displayPolicy)
+		requiresMMIORegistersWriteAccess = true;
 
 	// Submissions closer together than this mean the GPU is under sustained load
 	nanoseconds_to_absolutetime(8 * 1000 * 1000, &busyInterval);

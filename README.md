@@ -169,7 +169,7 @@ Read [FAQs](./Manual/) and avoid asking any questions. No support is provided fo
 
 #### Experimental branch
 
-This `experimental` branch is `master` plus an **experimental** Intel graphics power option. Everything below is off unless you add the boot argument, and removing it restores the `master` behaviour. Keep a bootable copy of your current EFI while testing.
+This `experimental` branch is `master` plus an **experimental** Intel graphics power option. **Default: off.** Without `igfxpwr` in `boot-args` (or with `igfxpwr=0`) none of the features below run, and the kext behaves exactly like `master`; each bit has to be added explicitly. There is no DeviceProperties equivalent, so nothing can turn them on by accident. Removing the boot argument restores the `master` behaviour. Keep a bootable copy of your current EFI while testing.
 
 ##### What is added
 
