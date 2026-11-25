@@ -204,6 +204,12 @@ private:
 	 *  Framebuffer list, imported from the framebuffer kext
 	 */
 	void *gPlatformInformationList {nullptr};
+	enum PowerOption : uint32_t { Diagnose = 1, RequestFBC = 2, RequestCDCLK = 4, RespectEPP = 8 };
+	uint32_t powerOptions {0};
+	uint32_t powerFramebufferId {0};
+	bool powerKblLayout {false};
+	uint32_t powerFlagMask {0};
+	void applyPowerFlags(IOService *controller);
 
 	/**
 	 *  Framebuffer list is in Sandy Bridge format
@@ -1306,7 +1312,23 @@ private:
 		 *  RC6 monitor (-igfxrc6fix): records the RC6 configuration the driver programmed and restores it
 		 *  when it was lost (e.g. after S3/S4), and logs RC6 problems it cannot fix
 		 */
+		struct Event;
 		bool rc6Fix {false};
+		bool diagnostics {false};
+		uint64_t sampleTime {0}, sampleWall {0}, telemetryInterval {0}, nextTelemetry {0};
+		uint32_t sampleTicks {0};
+		uint64_t deferBoostUntil {0};
+		int (*readMsr)(uint32_t, uint32_t *, uint32_t *) {nullptr};
+		void sampleTelemetry(void *controller);
+		void publishTelemetry(const Event &event);
+		void sampleEPP();
+		enum { DisplayRegisterCount = 7 };
+		uint32_t displayValues[DisplayRegisterCount] {};
+		uint32_t seenDisplay {0};
+		uint32_t wakeCalls[3][2] {}, wakeContexts[3] {};
+		bool wakeHookInstalled {false};
+		void (*orgObservedWake)(void *, bool, uint32_t, uint32_t) {nullptr};
+		static void observeWake(void *, bool, uint32_t, uint32_t);
 		bool rc6HaveSnapshot {false};
 		uint32_t rc6GoodCount {0};
 		uint32_t rc6LostCount {0};
@@ -1362,6 +1384,9 @@ private:
 		 *  True if this fix is available for the current Intel platform
 		 */
 		bool available {false};
+		void observeDisplayRead(uint32_t address, uint32_t value);
+		void countWake(bool set, uint32_t domains, uint32_t context);
+		void wakeHookReady() { __atomic_store_n(&wakeHookInstalled, true, __ATOMIC_RELEASE); }
 		~RPSControlPatch() override { deinit(); }
 		
 		// MARK: Patch Submodule IMP

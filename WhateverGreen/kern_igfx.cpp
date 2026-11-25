@@ -196,6 +196,21 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		disableIGTelemetry = info->videoBuiltin->getProperty("disable-telemetry-load") != nullptr || checkKernelArgument("-igfxnotelemetryload");
 
 		bool connectorLessFrame = info->reportedFramebufferIsConnectorLess;
+		uint32_t options = 0;
+		if (!disableAccel && !connectorLessFrame &&
+			(cpuGeneration == CPUInfo::CpuGeneration::KabyLake ||
+			 cpuGeneration == CPUInfo::CpuGeneration::CoffeeLake ||
+			 cpuGeneration == CPUInfo::CpuGeneration::CometLake) &&
+			PE_parse_boot_argn("igfxpwr", &options, sizeof(options)) && !(options & ~15U)) {
+			powerOptions = options;
+			powerFramebufferId = info->reportedFramebufferId;
+			if (!framebufferPatchFlags.bits.FPFFlags) {
+				if (options & RequestFBC)
+					powerFlagMask |= 0x14; // FBC and dynamic FBC
+				if (options & RequestCDCLK)
+					powerFlagMask |= 0x200000; // FBEnableDynamicCDCLK
+			}
+		}
 
 		int gl = info->videoBuiltin->getProperty("disable-metal") != nullptr;
 		PE_parse_boot_argn("igfxgl", &gl, sizeof(gl));
@@ -236,7 +251,7 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		
 		// Ideally, we could get rid of these two lambda expressions
 		auto requiresFramebufferPatches = [this]() {
-			if (applyFramebufferPatch || hdmiAutopatch)
+			if (applyFramebufferPatch || hdmiAutopatch || powerFlagMask)
 				return true;
 			if (dumpFramebufferToDisk || dumpPlatformTable)
 				return true;
@@ -343,7 +358,8 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 			if (submodule->enabled)
 				submodule->processFramebufferKext(patcher, index, address, size);
 
-		if (applyFramebufferPatch || dumpFramebufferToDisk || dumpPlatformTable || hdmiAutopatch) {
+		if (applyFramebufferPatch || dumpFramebufferToDisk || dumpPlatformTable || hdmiAutopatch || powerFlagMask) {
+			powerKblLayout = getRealFramebuffer(index) == &kextIntelKBLFb;
 			framebufferStart = reinterpret_cast<uint8_t *>(address);
 			framebufferSize = size;
 			
@@ -498,6 +514,8 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 	
 	// Invoke the original function
 	uint32_t retVal = callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32(controller, address);
+	if (callbackIGFX->powerOptions & (Diagnose | RespectEPP))
+		callbackIGFX->modRPSControlPatch.observeDisplayRead(address, retVal);
 	if (callbackIGFX->modMMIORegistersReadSupport.verbose)
 		DBGLOG("igfx", "RRS: Read MMIO Register = 0x%x; Value = 0x%x.", address, retVal);
 	
@@ -1175,6 +1193,41 @@ bool IGFX::wrapAcceleratorStart(IOService *that, IOService *provider) {
 	return ret;
 }
 
+void IGFX::applyPowerFlags(IOService *controller) {
+	auto table = reinterpret_cast<uintptr_t>(gPlatformInformationList);
+	auto start = reinterpret_cast<uintptr_t>(framebufferStart);
+	if (!table || !powerFramebufferId || table < start || table - start >= framebufferSize)
+		return;
+	auto bytes = min(static_cast<size_t>(64 * 1024), framebufferSize - static_cast<size_t>(table - start));
+	// Both tables start with a framebuffer ID, but their element strides and flags differ.
+	auto apply = [&](auto *frame) -> bool {
+		decltype(frame) match = nullptr;
+		for (size_t offset = 0; offset + sizeof(uint32_t) * 2 <= bytes; offset += sizeof(*frame), ++frame) {
+			// Require a terminator on an entry boundary before changing any flags.
+			if (frame->framebufferId == UINT32_MAX && frame->pad == 0) {
+				if (match) {
+					uint32_t flags = match->flags.value | powerFlagMask;
+					match->flags.value = flags;
+					controller->setProperty("weg-power-framebuffer-flags", flags, 32);
+					return true;
+				}
+				return false;
+			}
+			if (offset + sizeof(*frame) > bytes)
+				return false;
+			if (frame->framebufferId == powerFramebufferId && frame->fPortCount) {
+				if (match)
+					return false;
+				match = frame;
+			}
+		}
+		return false;
+	};
+	bool applied = powerKblLayout ? apply(static_cast<FramebufferSKL *>(gPlatformInformationList)) :
+		apply(static_cast<FramebufferCFL *>(gPlatformInformationList));
+	controller->setProperty("weg-power-framebuffer-matched", static_cast<uint32_t>(applied), 32);
+}
+
 bool IGFX::wrapGetOSInformation(IOService *that) {
 	auto cpuGeneration = BaseDeviceInfo::get().cpuGeneration;
 	
@@ -1201,6 +1254,8 @@ bool IGFX::wrapGetOSInformation(IOService *that) {
 		callbackIGFX->applyWestmereFeaturePatches(that);
 	else if (callbackIGFX->hdmiAutopatch)
 		callbackIGFX->applyHdmiAutopatch();
+	if (callbackIGFX->powerFlagMask)
+		callbackIGFX->applyPowerFlags(that);
 
 #ifdef DEBUG
 	if (callbackIGFX->dumpPlatformTable)
