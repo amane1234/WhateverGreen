@@ -18,7 +18,7 @@
 - RPS control reads the fused RP limits once and caches them; `igfxrpsc=1` now boosts only when submissions stay close together for a full sampling window
 - RC6 events are queued instead of overwriting each other, RC6 restores re-check the live configuration and the force-wake ACK before every write, and the monitor shuts down cleanly
 - Force wake no longer panics after an ACK timeout: the request falls back to Apple's routine; the fallback bit is shared safely between contexts and polling backs off without sleeping
-- Added experimental `igfxpwr=MASK` for KBL/CFL/CML: `1` publishes RC6 residency, observed ForceWake requests and display registers (PSR, DC states, FBC, CDCLK) as `weg-power-*` IGPU properties, `2` requests native FBC/dynamic FBC, `4` requests native dynamic CDCLK, `8` defers the `igfxrpsc=1` boost while the CPU's HWP EPP prefers power saving. See `Manual/IntelPowerExperiments.md`
+- Added experimental `igfxpwr=MASK` for KBL/CFL/CML: `1` publishes RC6 residency, observed ForceWake requests and display registers (PSR, DC states, FBC, CDCLK) as `weg-power-*` IGPU properties, `2` requests native FBC/dynamic FBC, `4` requests native dynamic CDCLK, `8` defers the `igfxrpsc=1` boost while the CPU's HWP EPP prefers power saving and boosts sooner while it prefers performance, `16` keeps PSR off, `32` limits DC states to DC5, `64` turns DC5/DC6 off, `128` turns off the forced complete modeset; observation also tracks per-context ForceWake hold times, hardware ACK bits and a leak suspicion flag. See `Manual/IntelPowerExperiments.md`
 
 #### v1.7.0
 - Added constants for macOS 26 support

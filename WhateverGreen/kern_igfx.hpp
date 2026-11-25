@@ -204,7 +204,11 @@ private:
 	 *  Framebuffer list, imported from the framebuffer kext
 	 */
 	void *gPlatformInformationList {nullptr};
-	enum PowerOption : uint32_t { Diagnose = 1, RequestFBC = 2, RequestCDCLK = 4, RespectEPP = 8 };
+	enum PowerOption : uint32_t {
+		Diagnose = 1, RequestFBC = 2, RequestCDCLK = 4, RespectEPP = 8,
+		DisablePSR = 16, LimitDC5 = 32, DisableDC = 64, NativeModeset = 128,
+		AllPowerOptions = 255
+	};
 	uint32_t powerOptions {0};
 	uint32_t powerFramebufferId {0};
 	bool powerKblLayout {false};
@@ -1326,7 +1330,25 @@ private:
 		uint32_t displayValues[DisplayRegisterCount] {};
 		uint32_t seenDisplay {0};
 		uint32_t wakeCalls[3][2] {}, wakeContexts[3] {};
+		// igfxpwr=1: when each context bit was set on each domain (0 = not held), and the hardware ACK
+		// bits last read with the GT awake. Together they show which context keeps a domain awake.
+		uint64_t wakeHoldSince[3][15] {};
+		uint32_t wakeAck[3] {};
 		bool wakeHookInstalled {false};
+		// igfxpwr=8: while the CPU's HWP EPP prefers performance, boost after one busy interval
+		uint64_t fastBoostUntil {0};
+		// igfxpwr=16/32/64: filters on the Apple framebuffer's PSR and DC state writes
+		static constexpr uint32_t PSR1Control = 0x6F800;   // EDP_PSR_CTL, bit 31 enables PSR1
+		static constexpr uint32_t PSR2Control = 0x6F900;   // EDP_PSR2_CTL, bit 31 enables PSR2
+		static constexpr uint32_t DCStateEnable = 0x45504; // DC_STATE_EN, bits 1:0 = 1 up to DC5, 2 up to DC6
+		bool displayPolicy {false};
+		bool displayPolicyRegistered {false};
+		uint32_t filteredWrites[3] {};                     // PSR1, PSR2, DC state
+		static void filterPSR(void *controller, uint32_t address, uint32_t value);
+		static void filterDCState(void *controller, uint32_t address, uint32_t value);
+		MMIOWriteInjectionDescriptor dPSR1 {PSR1Control, filterPSR};
+		MMIOWriteInjectionDescriptor dPSR2 {PSR2Control, filterPSR};
+		MMIOWriteInjectionDescriptor dDCState {DCStateEnable, filterDCState};
 		void (*orgObservedWake)(void *, bool, uint32_t, uint32_t) {nullptr};
 		static void observeWake(void *, bool, uint32_t, uint32_t);
 		bool rc6HaveSnapshot {false};

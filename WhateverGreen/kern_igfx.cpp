@@ -201,7 +201,7 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 			(cpuGeneration == CPUInfo::CpuGeneration::KabyLake ||
 			 cpuGeneration == CPUInfo::CpuGeneration::CoffeeLake ||
 			 cpuGeneration == CPUInfo::CpuGeneration::CometLake) &&
-			PE_parse_boot_argn("igfxpwr", &options, sizeof(options)) && !(options & ~15U)) {
+			PE_parse_boot_argn("igfxpwr", &options, sizeof(options)) && !(options & ~AllPowerOptions)) {
 			powerOptions = options;
 			powerFramebufferId = info->reportedFramebufferId;
 			if (!framebufferPatchFlags.bits.FPFFlags) {
@@ -635,6 +635,13 @@ void IGFX::ForceCompleteModeset::processKernel(KernelPatcher &patcher, DeviceInf
 	} else if (info->firmwareVendor == DeviceInfo::FirmwareVendor::Apple) {
 		enabled = false; // may interfere with FV2
 		DBGLOG("weg", "force complete-modeset overriden by Apple firmware -> %d", enabled);
+	} else if (callbackIGFX->powerOptions & NativeModeset) {
+		// igfxpwr=128: let the Apple driver decide when a complete modeset is needed, avoiding the extra
+		// full modesets the forced mode causes (blink, link retraining). igfxfcms or complete-modeset win.
+		enabled = false;
+		if (info->videoBuiltin)
+			info->videoBuiltin->setProperty("weg-power-native-modeset", 1U, 32);
+		DBGLOG("weg", "force complete-modeset disabled by igfxpwr -> %d", enabled);
 	}
 	
 	if (enabled) {

@@ -201,14 +201,18 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 			}
 		}
 	}
+	// igfxpwr=16/32/64 filter the framebuffer's own PSR and DC state writes, so they need the write hook
+	displayPolicy = (callbackIGFX->powerOptions & (DisablePSR | LimitDC5 | DisableDC)) != 0;
 	if (rc6Fix || diagnostics) {
 		enabled = true;
-		requiresMMIORegistersWriteAccess = rc6Fix;
 		if (rc6Fix)
 			nanoseconds_to_absolutetime(1000ULL * 1000 * 1000, &rc6CheckInterval);
 		else
 			rc6CheckInterval = telemetryInterval;
 	}
+	if (displayPolicy)
+		enabled = true;
+	requiresMMIORegistersWriteAccess = rc6Fix || displayPolicy;
 
 	// Submissions closer together than this mean the GPU is under sustained load
 	nanoseconds_to_absolutetime(8 * 1000 * 1000, &busyInterval);
@@ -224,7 +228,7 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 	}
 
 	if (enabled) {
-		if ((gtFloorCap || rc6Fix || diagnostics) && info->videoBuiltin && !igpu) {
+		if ((gtFloorCap || rc6Fix || diagnostics || displayPolicy) && info->videoBuiltin && !igpu) {
 			igpu = info->videoBuiltin;
 			igpu->retain();
 		}
@@ -236,6 +240,12 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 			info->videoBuiltin->setProperty("weg-rps-control-mode", mode, 32);
 		if (diagnostics)
 			publish("weg-power-status", "waiting for GPU notifications");
+		if (callbackIGFX->powerOptions & DisablePSR)
+			publish("weg-power-psr-policy", "PSR1/PSR2 enable writes cleared");
+		if (callbackIGFX->powerOptions & DisableDC)
+			publish("weg-power-dc-policy", "DC5/DC6 disabled");
+		else if (callbackIGFX->powerOptions & LimitDC5)
+			publish("weg-power-dc-policy", "limited to DC5");
 		if (rc6Fix)
 			publish("weg-rc6-status", "monitoring");
 	}
@@ -293,7 +303,8 @@ bool IGFX::RPSControlPatch::sustainedSubmissions(uint64_t now) {
 		if (!lastNotify || now - lastNotify > busyInterval)
 			burstStart = now;
 		else
-			boost = now - burstStart >= 2 * busyInterval;
+			// Sustained load normally needs two busy intervals; one while the CPU prefers performance
+			boost = now - burstStart >= (now < __atomic_load_n(&fastBoostUntil, __ATOMIC_RELAXED) ? 1 : 2) * busyInterval;
 		lastNotify = now;
 	}
 	__atomic_store_n(&samplingLoad, false, __ATOMIC_RELEASE);
@@ -361,7 +372,16 @@ void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_
 			gtFloorCap = 0;
 		}
 	}
-	if (!gtFloorCap && !rc6Fix && !diagnostics)
+	if (displayPolicy && !displayPolicyRegistered) {
+		displayPolicyRegistered = true;
+		if (callbackIGFX->powerOptions & DisablePSR) {
+			callbackIGFX->modMMIORegistersWriteSupport.replacerList.add(&dPSR1);
+			callbackIGFX->modMMIORegistersWriteSupport.replacerList.add(&dPSR2);
+		}
+		if (callbackIGFX->powerOptions & (LimitDC5 | DisableDC))
+			callbackIGFX->modMMIORegistersWriteSupport.replacerList.add(&dDCState);
+	}
+	if (!gtFloorCap && !rc6Fix && !diagnostics && !displayPolicy)
 		OSSafeReleaseNULL(igpu);
 }
 
@@ -546,6 +566,14 @@ void IGFX::RPSControlPatch::sampleTelemetry(void *controller) {
 	const uint32_t ack = callbackIGFX->readRegister32(controller, FORCEWAKE_ACK_RENDER_GEN9);
 	if (ack == UINT32_MAX || !(ack & 0xFFFF))
 		return;
+	// Hardware view of the force-wake context bits, to compare with the requests the hook saw
+	__atomic_store_n(&wakeAck[0], ack & 0xFFFF, __ATOMIC_RELAXED);
+	const unsigned others[] = {DOM_MEDIA, DOM_BLITTER};
+	for (unsigned i = 0; i < arrsize(others); ++i) {
+		const uint32_t value = callbackIGFX->readRegister32(controller, ackForDom(others[i]));
+		if (value != UINT32_MAX)
+			__atomic_store_n(&wakeAck[i + 1], value & 0xFFFF, __ATOMIC_RELAXED);
+	}
 	uint32_t ticks = callbackIGFX->readRegister32(controller, GEN6_GT_GFX_RC6);
 	const uint64_t now = mach_absolute_time();
 	uint64_t uptime = 0, elapsed = 0;
@@ -582,10 +610,16 @@ void IGFX::RPSControlPatch::countWake(bool set, uint32_t domains, uint32_t conte
 		__atomic_fetch_add(&wakeCalls[i][set ? 1 : 0], 1U, __ATOMIC_RELAXED);
 		// This is the last observed request for each context bit, before any ACK.
 		if (context < 15) {
-			if (set)
+			if (set) {
 				__atomic_fetch_or(&wakeContexts[i], 1U << context, __ATOMIC_RELAXED);
-			else
+				// Start of a hold: a repeated set keeps the original start time
+				uint64_t idle = 0;
+				__atomic_compare_exchange_n(&wakeHoldSince[i][context], &idle, mach_absolute_time(), false,
+											__ATOMIC_RELAXED, __ATOMIC_RELAXED);
+			} else {
 				__atomic_fetch_and(&wakeContexts[i], ~(1U << context), __ATOMIC_RELAXED);
+				__atomic_store_n(&wakeHoldSince[i][context], 0, __ATOMIC_RELAXED);
+			}
 		}
 	}
 }
@@ -594,6 +628,37 @@ void IGFX::RPSControlPatch::observeWake(void *accelerator, bool set, uint32_t do
 	auto &self = callbackIGFX->modRPSControlPatch;
 	self.countWake(set, domains, context);
 	self.orgObservedWake(accelerator, set, domains, context);
+}
+
+// igfxpwr=16: the framebuffer enables PSR1/PSR2 with bit 31 of EDP_PSR_CTL/EDP_PSR2_CTL. Clearing it keeps
+// the rest of the configuration the driver wrote, so the link stays as the driver set it up; PSR is never
+// entered. Writes that disable PSR go through unchanged.
+void IGFX::RPSControlPatch::filterPSR(void *controller, uint32_t address, uint32_t value) {
+	auto &self = callbackIGFX->modRPSControlPatch;
+	constexpr uint32_t enable = 1U << 31;
+	if (value & enable) {
+		value &= ~enable;
+		__atomic_fetch_add(&self.filteredWrites[address == PSR2Control ? 1 : 0], 1U, __ATOMIC_RELAXED);
+	}
+	callbackIGFX->writeRegister32(controller, address, value);
+}
+
+// igfxpwr=32/64: DC_STATE_EN bits 1:0 select the deepest display C-state the DMC may enter (1 = DC5,
+// 2 = DC6). Only lower what the driver asks for: 32 turns a DC6 request into DC5, 64 clears both. The
+// other bits (e.g. DC9) are left alone.
+void IGFX::RPSControlPatch::filterDCState(void *controller, uint32_t address, uint32_t value) {
+	auto &self = callbackIGFX->modRPSControlPatch;
+	const uint32_t requested = value & 3U;
+	uint32_t allowed = requested;
+	if (callbackIGFX->powerOptions & DisableDC)
+		allowed = 0;
+	else if ((callbackIGFX->powerOptions & LimitDC5) && requested == 2)
+		allowed = 1;
+	if (allowed != requested) {
+		value = (value & ~3U) | allowed;
+		__atomic_fetch_add(&self.filteredWrites[2], 1U, __ATOMIC_RELAXED);
+	}
+	callbackIGFX->writeRegister32(controller, address, value);
 }
 
 namespace {
@@ -628,13 +693,22 @@ void IGFX::RPSControlPatch::sampleEPP() {
 		if (!(hi & (1U << 10)) || (hi & (1U << 28)) || !readMsr(0x772, &lo, &hi))
 			epp = lo >> 24;
 	}
-	const bool defer = mode == 1 && epp != UINT32_MAX && epp >= 128;
-	__atomic_store_n(&deferBoostUntil, defer ? mach_absolute_time() + 2 * telemetryInterval : 0, __ATOMIC_RELAXED);
+	// Both directions follow the CPU's own preference: EPP 128-255 (power saving) defers the extra RP0
+	// boost, EPP 0-63 (performance) boosts after one busy interval instead of two, 64-127 keeps the default.
+	// Each hint lasts two sampling intervals and expires on a read failure. No MSR is written.
+	const bool known = mode == 1 && epp != UINT32_MAX;
+	const bool defer = known && epp >= 128;
+	const bool fast = known && epp <= 63;
+	const uint64_t until = mach_absolute_time() + 2 * telemetryInterval;
+	__atomic_store_n(&deferBoostUntil, defer ? until : 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&fastBoostUntil, fast ? until : 0, __ATOMIC_RELAXED);
 	if (epp == UINT32_MAX)
 		igpu->removeProperty("weg-power-hwp-epp");
 	else
 		publish("weg-power-hwp-epp", epp);
 	publish("weg-power-defer-rp0", static_cast<uint32_t>(defer));
+	publish("weg-power-boost-bias", defer ? "power saving: RP0 boost deferred" :
+			fast ? "performance: RP0 boost after one busy interval" : "balanced: default RP0 boost");
 }
 
 void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
@@ -655,6 +729,8 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 	const bool hooked = __atomic_load_n(&wakeHookInstalled, __ATOMIC_ACQUIRE);
 	publish("weg-power-forcewake-hook", static_cast<uint32_t>(hooked));
 	if (hooked) {
+		const uint64_t now = mach_absolute_time();
+		uint32_t suspect = 0; // bit per domain whose longest hold reached 30 s
 		const char *domains[] = {"render", "media", "blitter"};
 		for (unsigned i = 0; i < arrsize(domains); ++i) {
 			char key[48];
@@ -664,7 +740,40 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 			publish(key, __atomic_load_n(&wakeCalls[i][0], __ATOMIC_RELAXED));
 			snprintf(key, sizeof(key), "weg-power-fw-%s-contexts", domains[i]);
 			publish(key, __atomic_load_n(&wakeContexts[i], __ATOMIC_RELAXED));
+			snprintf(key, sizeof(key), "weg-power-fw-%s-ack", domains[i]);
+			publish(key, __atomic_load_n(&wakeAck[i], __ATOMIC_RELAXED));
+
+			// Longest current hold among the context bits of this domain
+			uint64_t oldest = 0;
+			uint32_t holder = 0;
+			for (uint32_t c = 0; c < arrsize(wakeHoldSince[i]); ++c) {
+				const uint64_t since = __atomic_load_n(&wakeHoldSince[i][c], __ATOMIC_RELAXED);
+				if (since && (!oldest || since < oldest)) {
+					oldest = since;
+					holder = c;
+				}
+			}
+			uint64_t heldNs = 0;
+			if (oldest && now > oldest)
+				absolutetime_to_nanoseconds(now - oldest, &heldNs);
+			const uint32_t heldMs = static_cast<uint32_t>(min(heldNs / 1000000, static_cast<uint64_t>(UINT32_MAX)));
+			snprintf(key, sizeof(key), "weg-power-fw-%s-longest-hold-ms", domains[i]);
+			publish(key, heldMs);
+			snprintf(key, sizeof(key), "weg-power-fw-%s-longest-holder", domains[i]);
+			if (oldest)
+				publish(key, holder);
+			else
+				igpu->removeProperty(key);
+			// A context that has held a domain for 30 s keeps the GT out of RC6 the whole time
+			if (heldMs >= 30000)
+				suspect |= 1U << i;
 		}
+		publish("weg-power-fw-leak-suspect", suspect);
+	}
+	if (displayPolicy) {
+		publish("weg-power-psr1-writes-cleared", __atomic_load_n(&filteredWrites[0], __ATOMIC_RELAXED));
+		publish("weg-power-psr2-writes-cleared", __atomic_load_n(&filteredWrites[1], __ATOMIC_RELAXED));
+		publish("weg-power-dc-writes-limited", __atomic_load_n(&filteredWrites[2], __ATOMIC_RELAXED));
 	}
 	if (callbackIGFX->powerOptions & RespectEPP)
 		sampleEPP();
