@@ -166,3 +166,38 @@ Read [FAQs](./Manual/) and avoid asking any questions. No support is provided fo
 - [Vandroiy](https://applelife.ru/members/vandroiy.83653/) for maintaining the GPU model detection database
 - [YungRaj](https://github.com/YungRaj) and [syscl](https://github.com/syscl) for Intel fix backporting
 - [vit9696](https://github.com/vit9696) for writing the software and maintaining it
+
+#### Experimental branch
+
+This `experimental` branch is `master` plus an **experimental** Intel graphics power option. Everything below is off unless you add the boot argument, and removing it restores the `master` behaviour. Keep a bootable copy of your current EFI while testing.
+
+##### What is added
+
+`igfxpwr=MASK` for a display-connected Kaby Lake, Coffee Lake or Comet Lake iGPU on the Apple KBL/CFL framebuffer. `MASK` is the sum of these bits:
+
+| Bit | Value | Effect |
+|---|---|---|
+| Observe | `1` | Publishes GT RC6 residency, observed ForceWake set/clear calls, and the last PSR, DC state, FBC and CDCLK registers the Apple framebuffer read, as `weg-power-*` properties on IGPU. Samples ride on GPU notifications at most every 5 s; no new timer. Changes nothing. |
+| FBC | `2` | Asks the Apple framebuffer for native FBC and dynamic FBC (adds flags to the selected platform entry). |
+| CDCLK | `4` | Asks for native dynamic CDCLK. Also needs Apple's `SupportDynamicCDClk=1` and `dc6config=3`. |
+| EPP | `8` | With `igfxrpsc=1`: while the CPU's HWP EPP prefers power saving (128–255), defers WhateverGreen's extra RP0 boost. Reads MSRs only, never writes them. Includes Observe. |
+
+An enabled explicit `framebuffer-flags` patch takes precedence over bits `2` and `4`. Full details: [Manual/IntelPowerExperiments.md](./Manual/IntelPowerExperiments.md).
+
+##### How to test it
+
+1. Build this branch: `bash build-whatevergreen.sh Release experimental`, or take the artifact of the GitHub Actions run for this branch. Replace `EFI/OC/Kexts/WhateverGreen.kext`.
+2. Start with observation only. Add `igfxpwr=1` to `boot-args` and reboot.
+3. Use the desktop for a few seconds, then read the values:
+
+   ```sh
+   ioreg -lw0 -p IOService | grep '"weg-power-'
+   ```
+
+   `weg-power-rc6-permille` is the share of the last window spent in GT RC6 (900 = 90%), `weg-power-window-ms` the window length and `weg-power-status` whether the window was valid. A fully idle GPU may leave an old sample visible.
+4. Then test **one** policy change per boot, comparing with the `igfxpwr=1` readings:
+   - `igfxpwr=3`: FBC (check that `weg-power-framebuffer-matched` is `1`)
+   - `igfxpwr=5`: dynamic CDCLK
+   - `igfxpwr=9 igfxrpsc=1`: EPP-aware boost (`weg-power-hwp-epp`, `weg-power-defer-rp0`)
+5. For each setting, keep brightness, panel mode, AC/battery state and workload the same, and compare several equal idle and video intervals. After changing display flags, also check wake from S3/S4, lid open/close and external display reconnect. Use an independent power measurement (for example `powermetrics` or battery drain) for watts or battery life.
+6. To go back, remove `igfxpwr` (and the extra `igfxrpsc`) from `boot-args` and reboot.
