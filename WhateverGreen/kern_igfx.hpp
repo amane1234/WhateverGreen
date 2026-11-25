@@ -207,7 +207,8 @@ private:
 	enum PowerOption : uint32_t {
 		Diagnose = 1, RequestFBC = 2, RequestCDCLK = 4, RespectEPP = 8,
 		DisablePSR = 16, LimitDC5 = 32, DisableDC = 64, NativeModeset = 128,
-		AllPowerOptions = 255
+		RequestDynamicFBC = 256,
+		AllPowerOptions = 511
 	};
 	uint32_t powerOptions {0};
 	uint32_t powerFramebufferId {0};

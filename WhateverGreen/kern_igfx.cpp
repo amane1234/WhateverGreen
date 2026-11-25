@@ -205,8 +205,11 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 			powerOptions = options;
 			powerFramebufferId = info->reportedFramebufferId;
 			if (!framebufferPatchFlags.bits.FPFFlags) {
+				// FBC and dynamic FBC are separate bits so a problem can be traced to one of them
 				if (options & RequestFBC)
-					powerFlagMask |= 0x14; // FBC and dynamic FBC
+					powerFlagMask |= 0x4;  // FBFramebufferCompression
+				if (options & RequestDynamicFBC)
+					powerFlagMask |= 0x10; // FBDynamicFBCEnable
 				if (options & RequestCDCLK)
 					powerFlagMask |= 0x200000; // FBEnableDynamicCDCLK
 			}

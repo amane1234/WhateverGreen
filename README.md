@@ -123,7 +123,7 @@ Read [FAQs](./Manual/) and avoid asking any questions. No support is provided fo
 | `igfxrpsc=1` 		 	| `rps-control` property on IGPU 	| Enable RPS control patch (improves IGPU performance). `1` boosts to the maximum frequency only under sustained load, `2` always requests the maximum frequency (old behaviour, can keep the GPU at maximum clock after S3/S4 sleep) 	|
 | `igfxgtfloor=MHz` 		| `gt-floor-freq` property on IGPU 	| With Apple GuC (`igfxfw=2`), cap the GPU minimum frequency that AGPM requests (e.g. 500 MHz) at the given value. Values at or below the hardware minimum give the hardware minimum (e.g. `igfxgtfloor=300`). KBL and CFL framebuffers only 	|
 | `-igfxrc6fix` 		 	| `enable-rc6-fix` property on IGPU 	| Restore the RC6 (GPU idle power state) configuration when it is lost, e.g. after S3/S4 sleep, and log RC6 problems (`igfx_pm` in the kernel log). SKL/KBL/CFL/CML only 	|
-| `igfxpwr=MASK` 		 	| N/A 	| **Experimental.** Power diagnostics and display power policy requests for a display-connected KBL/CFL/CML iGPU, off by default. Bits: `1` observe (RC6 residency, ForceWake requests and holds, display registers the framebuffer already reads, published as `weg-power-*` IGPU properties), `2` request native FBC and dynamic FBC, `4` request native dynamic CDCLK, `8` HWP-EPP-aware `igfxrpsc=1` boost in both directions (includes observation), `16` PSR off, `32` DC states limited to DC5, `64` DC5/DC6 off, `128` native modeset (no forced complete modeset). Try one policy change per boot. [Read the manual](./Manual/IntelPowerExperiments.md) 	|
+| `igfxpwr=MASK` 		 	| N/A 	| **Experimental.** Power diagnostics and display power policy requests for a display-connected KBL/CFL/CML iGPU, off by default. Bits: `1` observe (RC6 residency, ForceWake requests and holds, display registers the framebuffer already reads, published as `weg-power-*` IGPU properties), `2` request native FBC, `256` request dynamic FBC, `4` request native dynamic CDCLK, `8` HWP-EPP-aware `igfxrpsc=1` boost in both directions (includes observation), `16` PSR off, `32` DC states limited to DC5, `64` DC5/DC6 off, `128` native modeset (no forced complete modeset). Try one policy change per boot. [Read the manual](./Manual/IntelPowerExperiments.md) 	|
 | `igfxsnb=0` 		  | N/A 	| Disable IntelAccelerator name fix for Sandy Bridge CPUs 	|
 
 ##### Backlight
@@ -178,15 +178,16 @@ This `experimental` branch is `master` plus an **experimental** Intel graphics p
 | Bit | Value | Effect |
 |---|---|---|
 | Observe | `1` | Publishes GT RC6 residency, observed ForceWake set/clear calls with per-context hold times and the hardware ACK, and the last PSR, DC state, FBC and CDCLK registers the Apple framebuffer read, as `weg-power-*` properties on IGPU. Samples ride on GPU notifications at most every 5 s; no new timer. Changes nothing. |
-| FBC | `2` | Asks the Apple framebuffer for native FBC and dynamic FBC (adds flags to the selected platform entry). |
+| FBC | `2` | Asks the Apple framebuffer for native FBC (adds `FBFramebufferCompression`, 0x4, to the selected platform entry). |
 | CDCLK | `4` | Asks for native dynamic CDCLK. Also needs Apple's `SupportDynamicCDClk=1` and `dc6config=3`. |
 | EPP | `8` | With `igfxrpsc=1`, follows the CPU's HWP EPP in both directions: power saving (128–255) defers WhateverGreen's extra RP0 boost, performance (0–63) boosts after one busy interval instead of two. Reads MSRs only, never writes them. Includes Observe. |
 | PSR off | `16` | Clears the enable bit from the framebuffer's PSR1/PSR2 control writes, so PSR is never entered. |
 | DC5 limit | `32` | Writes a DC6 request as DC5. |
 | DC off | `64` | Clears DC5/DC6 from DC state writes (overrides `32`). |
+| Dynamic FBC | `256` | Adds `FBDynamicFBCEnable` (0x10) on its own. Combine with `2` for both, as bit `2` did before. Kept separate so a panic can be traced to FBC or to dynamic FBC. |
 | Native modeset | `128` | Turns off WhateverGreen's forced complete modeset so the Apple driver decides when one is needed, like `igfxfcms=0` (an explicit `igfxfcms` or `complete-modeset` wins). |
 
-An enabled explicit `framebuffer-flags` patch takes precedence over bits `2` and `4`. Bits `16`, `32` and `64` only lower what Apple's driver requests: they cannot enable PSR or a deeper DC state the driver did not ask for. Turning PSR or DC states off normally costs power; it is meant for A/B baselines and for finding the cause of flicker, wake or black-screen problems. Full details: [Manual/IntelPowerExperiments.md](./Manual/IntelPowerExperiments.md).
+An enabled explicit `framebuffer-flags` patch takes precedence over bits `2`, `4` and `256`. Bits `16`, `32` and `64` only lower what Apple's driver requests: they cannot enable PSR or a deeper DC state the driver did not ask for. Turning PSR or DC states off normally costs power; it is meant for A/B baselines and for finding the cause of flicker, wake or black-screen problems. Full details: [Manual/IntelPowerExperiments.md](./Manual/IntelPowerExperiments.md).
 
 ##### How to test it
 
@@ -200,7 +201,8 @@ An enabled explicit `framebuffer-flags` patch takes precedence over bits `2` and
 
    `weg-power-rc6-permille` is the share of the last window spent in GT RC6 (900 = 90%), `weg-power-window-ms` the window length and `weg-power-status` whether the window was valid. A fully idle GPU may leave an old sample visible.
 4. Then test **one** policy change per boot, comparing with the `igfxpwr=1` readings:
-   - `igfxpwr=3`: FBC (check that `weg-power-framebuffer-matched` is `1`)
+   - `igfxpwr=3`: FBC only (check that `weg-power-framebuffer-matched` is `1` and `weg-power-framebuffer-flags` has 0x4)
+   - `igfxpwr=257`: dynamic FBC only; `igfxpwr=259`: both. If FBC panics, try these separately to see which flag causes it. FBC places its compressed buffer in the iGPU's stolen memory (BIOS DVMT pre-allocated), so a panic can also mean that memory is too small
    - `igfxpwr=5`: dynamic CDCLK
    - `igfxpwr=9 igfxrpsc=1`: EPP-aware boost (`weg-power-hwp-epp`, `weg-power-defer-rp0`, `weg-power-boost-bias`)
    - `igfxpwr=17`: PSR off (`weg-power-psr1-writes-cleared`, `weg-power-psr2-writes-cleared` count the changed writes)
