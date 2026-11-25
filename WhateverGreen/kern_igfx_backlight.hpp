@@ -57,7 +57,7 @@ struct BrightnessRequest {
 	/**
 	 * The request ID to check if the request was changed
 	 */
-	uint32_t id {0};
+	uint64_t id {0};
 	
 	/**
 	 *  Create an empty request
@@ -67,8 +67,8 @@ struct BrightnessRequest {
 	/**
 	 *  Create a brightness request
 	 */
-	BrightnessRequest(uint32_t id, void *controller, uint32_t address, uint32_t target, uint32_t mask = 0xFFFFFFFF) :
-		id(id), controller(controller), address(address), target(target), mask(mask) {}
+	BrightnessRequest(uint64_t id, void *controller, uint32_t address, uint32_t target, uint32_t mask = 0xFFFFFFFF) :
+		controller(controller), address(address), target(target), mask(mask), id(id) {}
 	
 	/**
 	 *  Get the current brightness level
@@ -127,6 +127,7 @@ public:
 	 *  @return A non-null event source on success, `nullptr` otherwise.
 	 */
 	static BrightnessRequestEventSource *create(OSObject *owner);
+	void notify() { signalWorkAvailable(); }
 };
 
 #endif /* kern_igfx_backlight_hpp */

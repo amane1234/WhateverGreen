@@ -138,16 +138,6 @@ constexpr uint32_t ackForDom(unsigned d) {
 	return 0;
 }
 
-constexpr const char* const strForDom(unsigned d) {
-	if (d == DOM_RENDER)
-		return "Render";
-	if (d == DOM_MEDIA)
-		return "Media";
-	if (d == DOM_BLITTER)
-		return "Blitter";
-	return "(unk)";
-}
-
 constexpr uint32_t masked_field(uint32_t mask, uint32_t value) {
 	return (mask << 16) | value;
 }
@@ -186,11 +176,6 @@ void IGFX::RPSControlPatch::publish(const char *key, const char *value) {
 }
 
 void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
-	if (available && info->videoBuiltin && !igpu) {
-		igpu = info->videoBuiltin;
-		igpu->retain();
-	}
-
 	uint32_t rpsc = 0;
 	if (PE_parse_boot_argn("igfxrpsc", &rpsc, sizeof(rpsc)) ||
 		WIOKit::getOSDataValue(info->videoBuiltin, "rps-control", rpsc)) {
@@ -203,16 +188,9 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 	rc6Fix = available && (checkKernelArgument("-igfxrc6fix") ||
 		(info->videoBuiltin && info->videoBuiltin->getProperty("enable-rc6-fix") != nullptr));
 	if (rc6Fix) {
-		rc6LogCall = thread_call_allocate(reinterpret_cast<thread_call_func_t>(logRC6), this);
-		if (rc6LogCall) {
-			enabled = true;
-			requiresMMIORegistersWriteAccess = true;
-			nanoseconds_to_absolutetime(1000ULL * 1000 * 1000, &rc6CheckInterval);
-			SYSLOG(log, "RC6 monitor enabled (RPS control mode %u)", mode);
-		} else {
-			rc6Fix = false;
-			SYSLOG(log, "Failed to allocate the RC6 monitor log call");
-		}
+		enabled = true;
+		requiresMMIORegistersWriteAccess = true;
+		nanoseconds_to_absolutetime(1000ULL * 1000 * 1000, &rc6CheckInterval);
 	}
 
 	// Submissions closer together than this mean the GPU is under sustained load
@@ -223,21 +201,100 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 	uint32_t floorMHz = 0;
 	if (available && (PE_parse_boot_argn("igfxgtfloor", &floorMHz, sizeof(floorMHz)) ||
 		WIOKit::getOSDataValue(info->videoBuiltin, "gt-floor-freq", floorMHz)) && floorMHz > 0) {
-		gtFloorCap = (floorMHz + 49) / 50;
+		gtFloorCap = min(floorMHz / 50 + static_cast<uint32_t>(floorMHz % 50 != 0), 255U);
 		enabled = true;
 		SYSLOG(log, "GT floor capped at %u MHz", gtFloorCap * 50);
-		publish("weg-gt-floor-cap", gtFloorCap * 50);
-		publish("weg-gt-floor-status", "waiting for AGPM floor request");
 	}
 
 	if (enabled) {
-		publish("weg-rps-control-mode", mode);
+		if ((gtFloorCap || rc6Fix) && info->videoBuiltin && !igpu) {
+			igpu = info->videoBuiltin;
+			igpu->retain();
+		}
+		if (gtFloorCap) {
+			publish("weg-gt-floor-cap", gtFloorCap * 50);
+			publish("weg-gt-floor-status", "waiting for AGPM floor request");
+		}
+		if (info->videoBuiltin)
+			info->videoBuiltin->setProperty("weg-rps-control-mode", mode, 32);
 		if (rc6Fix)
 			publish("weg-rc6-status", "monitoring");
 	}
 }
 
+void IGFX::RPSControlPatch::deinit() {
+	__atomic_fetch_or(&rc6Sampler, 2U, __ATOMIC_ACQ_REL);
+	while (__atomic_load_n(&rc6Sampler, __ATOMIC_ACQUIRE) & 1)
+		IOSleep(1);
+	if (rc6LogCall) {
+		auto call = static_cast<thread_call_t>(rc6LogCall);
+		// No more producers. Wait for the sole consumer to finish using
+		// the registry entry before releasing it; this also works on XNU
+		// versions without thread_call_cancel_wait.
+		for (;;) {
+			auto irq = IOSimpleLockLockDisableInterrupt(logLock);
+			bool scheduled = logScheduled;
+			IOSimpleLockUnlockEnableInterrupt(logLock, irq);
+			if (!scheduled)
+				break;
+			IOSleep(1);
+		}
+		while (!thread_call_free(call))
+			IOSleep(1);
+		rc6LogCall = nullptr;
+	}
+	if (logLock) {
+		IOSimpleLockFree(logLock);
+		logLock = nullptr;
+	}
+	OSSafeReleaseNULL(igpu);
+}
+
+uint32_t IGFX::RPSControlPatch::readCaps(void *controller) {
+	uint32_t cached = __atomic_load_n(&rpCaps, __ATOMIC_RELAXED);
+	if (cached || !controller || !callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32)
+		return cached;
+	const auto value = callbackIGFX->readRegister32(controller, GEN6_RP_STATE_CAP);
+	const auto rp0 = value & 0xFF;
+	const auto rpn = (value >> 16) & 0xFF;
+	if (value == UINT32_MAX || !rpn || rp0 < rpn || rp0 > (UINT32_MAX >> GEN9_FREQUENCY_SHIFT) / GEN9_FREQ_SCALER)
+		return 0;
+	__atomic_compare_exchange_n(&rpCaps, &cached, value, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+	return cached ? cached : value;
+}
+
+bool IGFX::RPSControlPatch::sustainedSubmissions(uint64_t now) {
+	// A pair of submissions in the same frame is common even at idle.
+	// Require short gaps spanning a full sampling window. Out-of-order
+	// observations must not move the clock backward or create a boost.
+	if (__atomic_exchange_n(&samplingLoad, true, __ATOMIC_ACQUIRE))
+		return false;
+	bool boost = false;
+	if (now > lastNotify) {
+		if (!lastNotify || now - lastNotify > busyInterval)
+			burstStart = now;
+		else
+			boost = now - burstStart >= 2 * busyInterval;
+		lastNotify = now;
+	}
+	__atomic_store_n(&samplingLoad, false, __ATOMIC_RELEASE);
+	return boost;
+}
+
 void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (rc6Fix && !rc6LogCall) {
+		logLock = IOSimpleLockAlloc();
+		if (logLock)
+			rc6LogCall = thread_call_allocate(logRC6, this);
+		if (!rc6LogCall) {
+			if (logLock) {
+				IOSimpleLockFree(logLock);
+				logLock = nullptr;
+			}
+			rc6Fix = false;
+			publish("weg-rc6-status", "disabled: log allocation failed");
+		}
+	}
 	if (mode != 0 || rc6Fix) {
 		KernelPatcher::RouteRequest routeRequest = {
 			"__ZL15pmNotifyWrapperjjPyPj",
@@ -245,8 +302,17 @@ void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_
 			orgPmNotifyWrapper
 		};
 
-		if (!patcher.routeMultiple(index, &routeRequest, 1, address, size))
+		if (!patcher.routeMultiple(index, &routeRequest, 1, address, size)) {
 			SYSLOG(log, "Failed to route pmNotifyWrapper.");
+			if (rc6LogCall && !orgPmNotifyWrapper) {
+				thread_call_free(static_cast<thread_call_t>(rc6LogCall));
+				rc6LogCall = nullptr;
+				IOSimpleLockFree(logLock);
+				logLock = nullptr;
+				rc6Fix = false;
+				publish("weg-rc6-status", "disabled: pmNotifyWrapper not found");
+			}
+		}
 	}
 
 	// The doPMWork command numbers were verified on the KBL and CFL framebuffers only
@@ -270,6 +336,8 @@ void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_
 			gtFloorCap = 0;
 		}
 	}
+	if (!gtFloorCap && !rc6Fix)
+		OSSafeReleaseNULL(igpu);
 }
 
 IOReturn IGFX::RPSControlPatch::wrapDoPMWork(void *controller, uint32_t cmd, void *arg1, void *arg2, void *arg3) {
@@ -279,7 +347,9 @@ IOReturn IGFX::RPSControlPatch::wrapDoPMWork(void *controller, uint32_t cmd, voi
 		uint32_t requested = *static_cast<uint32_t *>(arg1);
 
 		// Never go below the hardware minimum (RPn) or above the maximum (RP0)
-		uint32_t cap = callbackIGFX->readRegister32(controller, GEN6_RP_STATE_CAP);
+		uint32_t cap = self.readCaps(controller);
+		if (!cap)
+			return self.orgDoPMWork(controller, cmd, arg1, arg2, arg3);
 		uint32_t rp0 = cap & 0xFF;
 		uint32_t rpn = (cap >> 16) & 0xFF;
 		uint32_t floor = self.gtFloorCap;
@@ -289,14 +359,15 @@ IOReturn IGFX::RPSControlPatch::wrapDoPMWork(void *controller, uint32_t cmd, voi
 			floor = rp0;
 
 		// doPMWork runs on the framebuffer's command gate, so publishing (registry lock) is fine here
-		if (self.gtFloorLogged != requested + 1) {
-			self.gtFloorLogged = requested + 1;
-			self.publish("weg-gt-floor-agpm", requested * 50);
+		const auto diagnosticMHz = min(requested, UINT32_MAX / 50) * 50;
+		if (self.gtFloorLogged != diagnosticMHz + 1) {
+			self.gtFloorLogged = diagnosticMHz + 1;
+			self.publish("weg-gt-floor-agpm", diagnosticMHz);
 			self.publish("weg-gt-floor-applied", (requested > floor ? floor : requested) * 50);
 			self.publish("weg-gt-floor-rpn", rpn * 50);
 			self.publish("weg-gt-floor-status", requested > floor ? "lowered AGPM floor" : "AGPM floor already low enough");
 			SYSLOG(log, "GT%u floor: AGPM requested %u MHz, using %u MHz (RPn %u MHz)",
-				   cmd == PMWORK_GT2_FLOOR ? 2 : 3, requested * 50, (requested > floor ? floor : requested) * 50, rpn * 50);
+				   cmd == PMWORK_GT2_FLOOR ? 2 : 3, diagnosticMHz, (requested > floor ? floor : requested) * 50, rpn * 50);
 		}
 
 		// Only lower the floor AGPM asks for, so a lower request still works
@@ -337,113 +408,99 @@ void IGFX::RPSControlPatch::processGraphicsKext(KernelPatcher &patcher, size_t i
 int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1, unsigned long long *a2, unsigned int *freq) {
 	auto &self = callbackIGFX->modRPSControlPatch;
 
-	if (self.mode == 0) {
-		// RC6 monitor only
-		int ret = self.orgPmNotifyWrapper(a0, a1, a2, freq);
-		if (self.rc6Fix)
-			self.checkRC6();
-		return ret;
-	}
-
-	// Submissions only happen with the GT awake, which is when the RC6 registers can be read
+	int ret = self.orgPmNotifyWrapper(a0, a1, a2, freq);
 	if (self.rc6Fix)
 		self.checkRC6();
-
-	if (self.mode == 2) {
-		// Legacy mode: request the maximum RPS at every exec list submission.
-		// This relies on RC6 (force wake clears) to save power. When RC6 is not entered again after
-		// S3/S4, the GPU stays at RP0 for the rest of the session.
-		uint32_t cfreq = 0;
-		self.orgPmNotifyWrapper(a0, a1, a2, &cfreq);
-
-		if (!self.freq_max) {
-			self.freq_max = callbackIGFX->readRegister32(callbackIGFX->defaultController(), GEN6_RP_STATE_CAP) & 0xFF;
-			DBGLOG(log, "Read RP0 %d", self.freq_max);
-		}
-
-		// Without RP0 (register not readable yet) keep the frequency the driver asked for: 0 would request
-		// the lowest frequency instead of the highest one
-		*freq = self.freq_max ? (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * self.freq_max : cfreq;
-		return 0;
-	}
-
-	// Adaptive mode: let the driver (AGPM) pick the frequency, and only boost to RP0 while submissions
-	// arrive back to back. Every request used to be RP0, so the frequency only dropped through RC6.
-	// After S3/S4 sleep, the GPU was then pinned at the maximum clock. Now the next light submission
-	// (cursor, compositor) restores the driver's own choice.
-	int ret = self.orgPmNotifyWrapper(a0, a1, a2, freq);
-
-	uint64_t now = mach_absolute_time();
-	uint64_t last = __atomic_exchange_n(&self.lastNotify, now, __ATOMIC_RELAXED);
-	// last > now: the timestamp came from another CPU a moment ago, treat it as busy
-	bool busy = last != 0 && (now < last || now - last <= self.busyInterval);
-	if (!busy)
+	if (self.mode == 0 || !freq || ret != 0)
+		return ret;
+	if (self.mode == 1 && !self.sustainedSubmissions(mach_absolute_time()))
 		return ret;
 
-	if (!self.freq_max) {
-		self.freq_max = callbackIGFX->readRegister32(callbackIGFX->defaultController(), GEN6_RP_STATE_CAP) & 0xFF;
-		DBGLOG(log, "Read RP0 %d", self.freq_max);
-	}
-
-	if (self.freq_max == 0)
-		return ret;
-
-	*freq = (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * self.freq_max;
-	return 0;
+	const uint32_t rp0 = self.readCaps(callbackIGFX->defaultController()) & 0xFF;
+	if (rp0)
+		*freq = (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * rp0;
+	return ret;
 }
 
 void IGFX::RPSControlPatch::postRC6Event(uint32_t event, uint32_t v0, uint32_t v1, uint32_t v2) {
-	// Called from the submission path, which may run in interrupt context: only record the event here
-	// and log it from a thread call
-	rc6LogValue[0] = v0;
-	rc6LogValue[1] = v1;
-	rc6LogValue[2] = v2;
-	__atomic_fetch_or(&rc6Events, event, __ATOMIC_RELEASE);
-	thread_call_enter(static_cast<thread_call_t>(rc6LogCall));
+	auto irq = IOSimpleLockLockDisableInterrupt(logLock);
+	if (logCount < arrsize(logQueue)) {
+		logQueue[(logHead + logCount) % arrsize(logQueue)] = {event, v0, v1, v2};
+		++logCount;
+	}
+	bool schedule = !logScheduled;
+	logScheduled = true;
+	IOSimpleLockUnlockEnableInterrupt(logLock, irq);
+	if (schedule)
+		thread_call_enter(static_cast<thread_call_t>(rc6LogCall));
 }
 
 void IGFX::RPSControlPatch::logRC6(void *param0, void *) {
 	auto &self = *static_cast<RPSControlPatch *>(param0);
-	uint32_t events = __atomic_exchange_n(&self.rc6Events, 0, __ATOMIC_ACQUIRE);
-	uint32_t v0 = self.rc6LogValue[0], v1 = self.rc6LogValue[1], v2 = self.rc6LogValue[2];
+	for (;;) {
+		auto irq = IOSimpleLockLockDisableInterrupt(self.logLock);
+		if (!self.logCount) {
+			self.logScheduled = false;
+			IOSimpleLockUnlockEnableInterrupt(self.logLock, irq);
+			return;
+		}
+		auto event = self.logQueue[self.logHead];
+		self.logHead = (self.logHead + 1) % arrsize(self.logQueue);
+		--self.logCount;
+		IOSimpleLockUnlockEnableInterrupt(self.logLock, irq);
+		self.reportEvent(event);
+	}
+}
 
+void IGFX::RPSControlPatch::reportEvent(const Event &event) {
+	const auto events = event.kind;
+	const auto v0 = event.v0, v1 = event.v1, v2 = event.v2;
 	if (events & RC6EventSnapshot) {
 		SYSLOG(log, "RC6: recorded the driver's RC6 configuration, RC_CONTROL 0x%08x PG_ENABLE 0x%08x", v0, v1);
-		self.publish("weg-rc6-control", v0);
-		self.publish("weg-rc6-status", "enabled");
+		publish("weg-rc6-control", v0);
+		publish("weg-rc6-status", "enabled");
 	}
 	if (events & RC6EventRestored) {
-		SYSLOG(log, "RC6: RC6 was disabled (RC_CONTROL 0x%08x), restored RC_CONTROL 0x%08x (attempt %u)", v0, v1, v2);
-		self.publish("weg-rc6-restores", ++self.rc6Restores);
-		self.publish("weg-rc6-status", "restored after it was disabled");
+		SYSLOG(log, "RC6: RC6 was disabled (RC_CONTROL 0x%08x), restored RC_CONTROL 0x%08x (total %u)", v0, v1, v2);
+		publish("weg-rc6-restores", v2);
+		publish("weg-rc6-status", "restored after it was disabled");
 	}
 	if (events & RC6EventGiveUp) {
 		SYSLOG(log, "RC6: the driver keeps RC6 disabled (RC_CONTROL 0x%08x), no more restores until RC6 is enabled again", v0);
-		self.publish("weg-rc6-status", "driver keeps RC6 disabled, restores stopped");
+		publish("weg-rc6-status", "driver keeps RC6 disabled, restores stopped");
 	}
 	if (events & RC6EventNever) {
 		SYSLOG(log, "RC6: the driver never enabled RC6 (RC_CONTROL 0x%08x), nothing to restore", v0);
-		self.publish("weg-rc6-control", v0);
-		self.publish("weg-rc6-status", "never enabled by the driver");
+		publish("weg-rc6-control", v0);
+		publish("weg-rc6-status", "never enabled by the driver");
 	}
 	if (events & RC6EventStall) {
 		SYSLOG(log, "RC6: RC6 is enabled but residency has not advanced for 60 s. Forcewake render ack 0x%08x media ack 0x%08x "
 			   "(bits held all the time mean a leaked forcewake reference keeps the GT out of RC6)", v0, v1);
-		self.publish("weg-rc6-forcewake-render", v0);
-		self.publish("weg-rc6-forcewake-media", v1);
-		self.publish("weg-rc6-status", "enabled but no residency for 60 s (forcewake held?)");
+		publish("weg-rc6-forcewake-render", v0);
+		publish("weg-rc6-forcewake-media", v1);
+		publish("weg-rc6-status", "enabled but no residency for 60 s (forcewake held?)");
 	}
 }
 
 void IGFX::RPSControlPatch::checkRC6() {
-	// Check at most once per second. The compare-exchange also keeps concurrent submissions out.
-	uint64_t now = mach_absolute_time();
-	uint64_t next = __atomic_load_n(&rc6NextCheck, __ATOMIC_RELAXED);
-	if (now < next || !__atomic_compare_exchange_n(&rc6NextCheck, &next, now + rc6CheckInterval, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+	const uint64_t now = mach_absolute_time();
+	if (now < __atomic_load_n(&rc6NextCheck, __ATOMIC_RELAXED))
 		return;
+	uint32_t idle = 0;
+	if (!__atomic_compare_exchange_n(&rc6Sampler, &idle, 1U, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+		return;
+	if (now >= __atomic_load_n(&rc6NextCheck, __ATOMIC_RELAXED)) {
+		__atomic_store_n(&rc6NextCheck, now + rc6CheckInterval, __ATOMIC_RELAXED);
+		sampleRC6(now);
+	}
+	__atomic_fetch_and(&rc6Sampler, ~1U, __ATOMIC_RELEASE);
+}
 
+void IGFX::RPSControlPatch::sampleRC6(uint64_t now) {
 	auto controller = callbackIGFX->defaultController();
-	if (!controller)
+	if (!controller || !callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32 ||
+		!callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32)
 		return;
 
 	// Read GT registers only while the render well is awake. Otherwise they read as 0, which would look
@@ -453,21 +510,32 @@ void IGFX::RPSControlPatch::checkRC6() {
 		return;
 
 	uint32_t rcControl = callbackIGFX->readRegister32(controller, GEN6_RC_CONTROL);
+	if (rcControl == UINT32_MAX)
+		return;
+	static_assert(sizeof(rc6Snapshot) / sizeof(rc6Snapshot[0]) == arrsize(RC6_REGISTERS), "RC6 snapshot layout");
 	constexpr size_t controlIndex = arrsize(RC6_REGISTERS) - 2;
 	constexpr size_t pgIndex = arrsize(RC6_REGISTERS) - 1;
 
 	if (rcControl & GEN6_RC_CTL_RC6_ENABLE) {
 		rc6LostCount = 0;
+		rc6NeverCount = 0;
 		if (!rc6EnabledSince)
 			rc6EnabledSince = now;
 
 		if (!rc6HaveSnapshot) {
 			// Wait until the driver's configuration is stable
 			if (++rc6GoodCount >= 3) {
-				for (size_t i = 0; i < arrsize(RC6_REGISTERS); i++)
+				for (size_t i = 0; i < arrsize(RC6_REGISTERS); i++) {
 					rc6Snapshot[i] = callbackIGFX->readRegister32(controller, RC6_REGISTERS[i]);
-				rc6HaveSnapshot = true;
+					if (rc6Snapshot[i] == UINT32_MAX)
+						return;
+				}
 				rc6LastResidency = callbackIGFX->readRegister32(controller, GEN6_GT_GFX_RC6);
+				const auto ack = callbackIGFX->readRegister32(controller, FORCEWAKE_ACK_RENDER_GEN9);
+				if (rc6Snapshot[controlIndex] != rcControl || rc6LastResidency == UINT32_MAX ||
+					ack == UINT32_MAX || !(ack & 0xFFFF))
+					return;
+				rc6HaveSnapshot = true;
 				rc6ResidencyChanged = now;
 				postRC6Event(RC6EventSnapshot, rc6Snapshot[controlIndex], rc6Snapshot[pgIndex]);
 			}
@@ -481,12 +549,17 @@ void IGFX::RPSControlPatch::checkRC6() {
 		// Residency should advance between submissions on an idle desktop. When it does not, something
 		// (usually a held forcewake reference) keeps the GT awake: report it, it is not safe to fix here.
 		uint32_t residency = callbackIGFX->readRegister32(controller, GEN6_GT_GFX_RC6);
+		if (residency == UINT32_MAX)
+			return;
 		if (residency != rc6LastResidency) {
 			rc6LastResidency = residency;
 			rc6ResidencyChanged = now;
 		} else if (now - rc6ResidencyChanged >= 60 * rc6CheckInterval && now >= rc6NextStallReport) {
-			rc6NextStallReport = now + 600 * rc6CheckInterval;
-			postRC6Event(RC6EventStall, ackRender, callbackIGFX->readRegister32(controller, FORCEWAKE_ACK_MEDIA_GEN9));
+			const auto media = callbackIGFX->readRegister32(controller, FORCEWAKE_ACK_MEDIA_GEN9);
+			if (media != UINT32_MAX) {
+				rc6NextStallReport = now + 600 * rc6CheckInterval;
+				postRC6Event(RC6EventStall, ackRender, media);
+			}
 		}
 		return;
 	}
@@ -507,21 +580,42 @@ void IGFX::RPSControlPatch::checkRC6() {
 		return;
 	rc6LostCount = 0;
 
-	// A restore that did not hold for 30 s means the driver disables RC6 on purpose: stop after 3
+	// Read every dependent register before modifying the first one. Do not
+	// enable RC6 over a partial configuration or replace a new driver setup.
+	uint32_t live[arrsize(RC6_REGISTERS)];
+	for (size_t i = 0; i < arrsize(RC6_REGISTERS); ++i) {
+		live[i] = callbackIGFX->readRegister32(controller, RC6_REGISTERS[i]);
+		if (live[i] == UINT32_MAX)
+			return;
+	}
+	if (live[controlIndex] != rcControl)
+		return;
+
+	// A restore that did not hold for 30 s means the driver may be
+	// disabling RC6 deliberately. Stop after three such attempts.
 	if (rc6LastRestore && now - rc6LastRestore < 30 * rc6CheckInterval && ++rc6FailedRestores >= 3) {
 		postRC6Event(RC6EventGiveUp, rcControl);
 		return;
 	}
 	rc6LastRestore = now;
-
-	for (size_t i = 0; i < arrsize(RC6_REGISTERS); i++) {
-		if (RC6_REGISTERS[i] == GEN9_PG_ENABLE && rc6Snapshot[i] == 0)
+	for (size_t i = 0; i < arrsize(RC6_REGISTERS); ++i) {
+		if (live[i] == rc6Snapshot[i] || (i == pgIndex && !rc6Snapshot[i]))
 			continue;
-		if (callbackIGFX->readRegister32(controller, RC6_REGISTERS[i]) != rc6Snapshot[i])
-			callbackIGFX->writeRegister32(controller, RC6_REGISTERS[i], rc6Snapshot[i]);
+		const auto ack = callbackIGFX->readRegister32(controller, FORCEWAKE_ACK_RENDER_GEN9);
+		if (ack == UINT32_MAX || !(ack & 0xFFFF))
+			return;
+		if (i == controlIndex && callbackIGFX->readRegister32(controller, GEN6_RC_CONTROL) != rcControl)
+			return;
+		callbackIGFX->writeRegister32(controller, RC6_REGISTERS[i], rc6Snapshot[i]);
+		if (callbackIGFX->readRegister32(controller, RC6_REGISTERS[i]) != rc6Snapshot[i]) {
+			rc6LastRestore = 0; // This failed write is accounted for immediately.
+			if (++rc6FailedRestores >= 3)
+				postRC6Event(RC6EventGiveUp, rcControl);
+			return;
+		}
 	}
 
-	postRC6Event(RC6EventRestored, rcControl, rc6Snapshot[controlIndex], rc6FailedRestores + 1);
+	postRC6Event(RC6EventRestored, rcControl, rc6Snapshot[controlIndex], ++rc6Restores);
 }
 
 bool IGFX::RPSControlPatch::patchRCSCheck(mach_vm_address_t& start) {
@@ -572,68 +666,76 @@ bool IGFX::RPSControlPatch::patchRCSCheck(mach_vm_address_t& start) {
 
 // MARK: - Force Wake Workaround
 
-bool IGFX::ForceWakeWorkaround::pollRegister(uint32_t reg, uint32_t val, uint32_t mask, uint32_t timeout) {
-	AbsoluteTime now, deadline;
+static uint64_t forceWakeDeadline() {
+	uint64_t deadline;
+	clock_interval_to_deadline(FORCEWAKE_ACK_TIMEOUT_MS, kMillisecondScale, &deadline);
+	return deadline;
+}
 
-	clock_interval_to_deadline(timeout, kMillisecondScale, &deadline);
-	
-	for (clock_get_uptime(&now); now < deadline; clock_get_uptime(&now)) {
-		auto rd = callbackIGFX->readRegister32(callbackIGFX->defaultController(), reg);
-
-//		DBGLOG(log, "Rd 0x%x = 0x%x, expected 0x%x", reg, rd, val);
-
+// SafeForceWakeMultithreaded can run in an IRQ or under a spinlock. Never
+// sleep here. Space out slow MMIO reads while keeping the common ACK fast.
+bool IGFX::ForceWakeWorkaround::pollRegister(void *controller, uint32_t reg, uint32_t val, uint32_t mask, uint64_t deadline) {
+	unsigned delay = 0;
+	do {
+		auto rd = callbackIGFX->readRegister32(controller, reg);
+		if (rd == UINT32_MAX)
+			return false;
 		if ((rd & mask) == val)
 			return true;
-	}
-
+		if (delay)
+			IODelay(delay);
+		delay = delay ? min(16U, delay * 2) : 1;
+	} while (mach_absolute_time() < deadline);
 	return false;
 }
 
-bool IGFX::ForceWakeWorkaround::forceWakeWaitAckFallback(uint32_t d, uint32_t val, uint32_t mask) {
-	unsigned pass = 1;
+bool IGFX::ForceWakeWorkaround::forceWakeWaitAckFallback(void *controller, uint32_t d, uint32_t val, uint32_t mask) {
+	auto &self = callbackIGFX->modForceWakeWorkaround;
+	// All contexts share bit 15 on a domain. Never clear another caller's pulse.
+	if (__atomic_fetch_or(&self.fallbackDomains, d, __ATOMIC_ACQUIRE) & d)
+		return false;
+	const auto deadline = forceWakeDeadline();
 	bool ack = false;
-	auto controller = callbackIGFX->defaultController();
-	
-	do {
-		pollRegister(ackForDom(d), 0, FORCEWAKE_KERNEL_FALLBACK, FORCEWAKE_ACK_TIMEOUT_MS);
+	for (unsigned pass = 1; pass <= 10 && mach_absolute_time() < deadline; ++pass) {
+		if (!pollRegister(controller, ackForDom(d), 0, FORCEWAKE_KERNEL_FALLBACK, deadline))
+			break;
 		callbackIGFX->writeRegister32(controller, regForDom(d), fw_set(FORCEWAKE_KERNEL_FALLBACK));
-		
 		IODelay(10 * pass);
-		pollRegister(ackForDom(d), FORCEWAKE_KERNEL_FALLBACK, FORCEWAKE_KERNEL_FALLBACK, FORCEWAKE_ACK_TIMEOUT_MS);
-		
-		ack = (callbackIGFX->readRegister32(controller, ackForDom(d)) & mask) == val;
-
+		const bool pulse = pollRegister(controller, ackForDom(d), FORCEWAKE_KERNEL_FALLBACK, FORCEWAKE_KERNEL_FALLBACK, deadline);
+		auto rd = callbackIGFX->readRegister32(controller, ackForDom(d));
 		callbackIGFX->writeRegister32(controller, regForDom(d), fw_clear(FORCEWAKE_KERNEL_FALLBACK));
-	} while (!ack && pass++ < 10);
-	
-//	DBGLOG(log, "Force wake fallback used to %s %s in %u passes", set ? "set" : "clear", strForDom(d), pass);
-	
+		ack = pulse && rd != UINT32_MAX && (rd & mask) == val;
+		if (!pulse || ack)
+			break;
+	}
+	__atomic_fetch_and(&self.fallbackDomains, ~d, __ATOMIC_RELEASE);
 	return ack;
 }
 
-/**
- * Port of i915 force wake. The difference with Apple code is as follows:
- * 1. 50 ms ACK timeouts, see https://patchwork.kernel.org/patch/7057561/
- * Apple code uses 90 ms.
- * 2. Use reserve bit as a fallback at primary ACK timeout, see https://patchwork.kernel.org/patch/10029821/
- */
+void IGFX::ForceWakeWorkaround::forceWake(void *accelerator, bool set, uint32_t dom, uint32_t ctx) {
+	auto &self = callbackIGFX->modForceWakeWorkaround;
+	auto controller = callbackIGFX->defaultController();
+	if (!controller || !callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32 ||
+		!callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32 ||
+		ctx >= 15 || (dom & ~(DOM_RENDER | DOM_MEDIA | DOM_BLITTER))) {
+		self.orgForceWake(accelerator, set, dom, ctx);
+		return;
+	}
 
-// NOTE: We are either in IRQ context, or in a spinlock critical section
-void IGFX::ForceWakeWorkaround::forceWake(void*, uint8_t set, uint32_t dom, uint32_t ctx) {
-	// ctx 2: IRQ, 1: normal
-	
-	uint32_t ack_exp = set << ctx;
-	uint32_t mask = 1 << ctx;
-	uint32_t wr = ack_exp | (1 << ctx << 16);
-	
-	for (unsigned d = DOM_FIRST; d <= DOM_LAST; d <<= 1)
-	if (dom & d) {
-		callbackIGFX->writeRegister32(callbackIGFX->defaultController(), regForDom(d), wr);
+	const uint32_t mask = 1U << ctx;
+	const uint32_t expected = set ? mask : 0;
+	for (unsigned d = DOM_FIRST; d <= DOM_LAST; d <<= 1) {
+		if (!(dom & d))
+			continue;
+		callbackIGFX->writeRegister32(controller, regForDom(d), masked_field(mask, expected));
 		IOPause(100);
-		if (!pollRegister(ackForDom(d), ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS) &&
-			!forceWakeWaitAckFallback(d, ack_exp, mask) &&
-			!pollRegister(ackForDom(d), ack_exp, mask, FORCEWAKE_ACK_TIMEOUT_MS))
-			PANIC(log, "ForceWake timeout for domain %s, expected 0x%x", strForDom(d), ack_exp);
+		if (!pollRegister(controller, ackForDom(d), expected, mask, forceWakeDeadline()) &&
+			!forceWakeWaitAckFallback(controller, d, expected, mask) &&
+			!pollRegister(controller, ackForDom(d), expected, mask, forceWakeDeadline())) {
+			// The ABI has no error return. Hand the unresolved request to
+			// Apple's original routine, with its own recovery/failure policy.
+			self.orgForceWake(accelerator, set, d, ctx);
+		}
 	}
 }
 
@@ -652,7 +754,8 @@ void IGFX::ForceWakeWorkaround::init() {
 void IGFX::ForceWakeWorkaround::processGraphicsKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	KernelPatcher::RouteRequest request = {
 		"__ZN16IntelAccelerator26SafeForceWakeMultithreadedEbjj",
-		forceWake
+		forceWake,
+		orgForceWake
 	};
 	
 	if (!patcher.routeMultiple(index, &request, 1, address, size))

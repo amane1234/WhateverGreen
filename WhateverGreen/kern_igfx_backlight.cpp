@@ -99,7 +99,7 @@ void IGFX::BacklightRegistersFix::wrapKBLWriteRegisterPWMFreq1(void *controller,
 	// We'll need this to restore later after system sleep.
 	if (self->targetBacklightFrequency == 0) {
 		// Guard: The system should be initialized with a non-zero PWM frequency
-		if (auto bootValue = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_FREQ1); bootValue != 0) {
+		if (auto bootValue = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_FREQ1); bootValue != 0 && bootValue != UINT32_MAX) {
 			DBGLOG("igfx", "BLR: [KBL ] WriteRegister32<BXT_BLC_PWM_FREQ1>: System initialized with BXT_BLC_PWM_FREQ1 = 0x%x.", bootValue);
 			DBGLOG("igfx", "BLR: [KBL ] WriteRegister32<BXT_BLC_PWM_FREQ1>: System initialized with BXT_BLC_PWM_CTL1 = 0x%x.",
 				   callbackIGFX->readRegister32(controller, BXT_BLC_PWM_CTL1));
@@ -116,7 +116,7 @@ void IGFX::BacklightRegistersFix::wrapKBLWriteRegisterPWMFreq1(void *controller,
 	uint16_t frequency = (value & 0xffff0000U) >> 16U;
 	uint16_t dutyCycle = value & 0xffffU;
 
-	uint32_t rescaledValue = frequency == 0 ? 0 : static_cast<uint32_t>((dutyCycle * static_cast<uint64_t>(self->targetBacklightFrequency)) / static_cast<uint64_t>(frequency));
+	uint32_t rescaledValue = frequency == 0 ? 0 : static_cast<uint32_t>((min(dutyCycle, frequency) * static_cast<uint64_t>(self->targetBacklightFrequency)) / static_cast<uint64_t>(frequency));
 	DBGLOG("igfx", "BLR: [KBL ] WriteRegister32<BXT_BLC_PWM_FREQ1>: Write PWM_DUTY1 0x%x/0x%x, rescaled to 0x%x/0x%x.",
 		   dutyCycle, frequency, rescaledValue, self->targetBacklightFrequency);
 
@@ -143,7 +143,9 @@ void IGFX::BacklightRegistersFix::wrapKBLWriteRegisterPWMCtrl1(void *controller,
 	
 	if (self->targetPwmControl == 0) {
 		// Save the original hardware PWM control value
-		self->targetPwmControl = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_CTL1);
+		auto control = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_CTL1);
+		if (control != UINT32_MAX)
+			self->targetPwmControl = control;
 	}
 
 	DBGLOG("igfx", "BLR: [KBL ] WriteRegister32<BXT_BLC_PWM_CTL1>: Write BXT_BLC_PWM_CTL1 0x%x, previous was 0x%x.",
@@ -154,7 +156,8 @@ void IGFX::BacklightRegistersFix::wrapKBLWriteRegisterPWMCtrl1(void *controller,
 		callbackIGFX->writeRegister32(controller, BXT_BLC_PWM_FREQ1, self->targetBacklightFrequency);
 
 		// Use the original hardware PWM control value.
-		value = self->targetPwmControl;
+		if (self->targetPwmControl)
+			value = self->targetPwmControl;
 	}
 	
 	// Finish by writing the new value
@@ -175,7 +178,7 @@ void IGFX::BacklightRegistersFix::wrapCFLWriteRegisterPWMFreq1(void *controller,
 	// We'll need this to restore later after system sleep.
 	if (self->targetBacklightFrequency == 0) {
 		// Guard: The system should be initialized with a non-zero PWM frequency
-		if (auto bootValue = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_FREQ1); bootValue != 0) {
+		if (auto bootValue = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_FREQ1); bootValue != 0 && bootValue != UINT32_MAX) {
 			DBGLOG("igfx", "BLR: [CFL+] WriteRegister32<BXT_BLC_PWM_FREQ1>: System initialized with BXT_BLC_PWM_FREQ1 = 0x%x.", bootValue);
 			self->targetBacklightFrequency = bootValue;
 		} else {
@@ -203,13 +206,15 @@ void IGFX::BacklightRegistersFix::wrapCFLWriteRegisterPWMDuty1(void *controller,
 		// CFL+ backlight additional fix.
 		DBGLOG("igfx", "BLR: [CFL+] WriteRegister32<BXT_BLC_PWM_DUTY1>: Backlight additional fix was entered.");
 		uint32_t registerValue = callbackIGFX->readRegister32(controller, SFUSE_STRAP);
+		if (registerValue == UINT32_MAX)
+			return;
 		uint32_t selectedFreq = (registerValue & SFUSE_STRAP_RAW_FREQUENCY) ? ICL_FREQ_RAW : ICL_FREQ_NORMAL;
 		wrapCFLWriteRegisterPWMFreq1(controller, BXT_BLC_PWM_FREQ1, selectedFreq);
 	}
 
 	if (self->driverBacklightFrequency && self->targetBacklightFrequency) {
 		// Translate the PWM duty cycle between the driver scale value and the HW scale value
-		uint32_t rescaledValue = static_cast<uint32_t>((value * static_cast<uint64_t>(self->targetBacklightFrequency)) / static_cast<uint64_t>(self->driverBacklightFrequency));
+		uint32_t rescaledValue = static_cast<uint32_t>((min(value, self->driverBacklightFrequency) * static_cast<uint64_t>(self->targetBacklightFrequency)) / static_cast<uint64_t>(self->driverBacklightFrequency));
 		DBGLOG("igfx", "BLR: [CFL+] WriteRegister32<BXT_BLC_PWM_DUTY1>: Write PWM_DUTY1 0x%x/0x%x, rescaled to 0x%x/0x%x.",
 			   value, self->driverBacklightFrequency, rescaledValue, self->targetBacklightFrequency);
 		value = rescaledValue;
@@ -934,16 +939,21 @@ IOReturn IGFX::BacklightRegistersAltFixKBL::wrapHwSetBacklight(void *controller,
 	DBGLOG("igfx", "BLT: [KBL ] Called with the controller at 0x%016llx and the brightness level 0x%x.", reinterpret_cast<uint64_t>(controller), brightness);
 	
 	// Step 1: Fetch and preserve the PWM control value set by the system firmware
-	self->fetchFirmwareBacklightControlIfNecessary(controller);
+	if (!self->fetchFirmwareBacklightControlIfNecessary(controller) && brightness)
+		return kIOReturnNotReady;
 	
 	// Step 2: Fetch and preserve the PWM frequency set by the system firmware
 	//         Note that we need to restore the frequency after the system wakes up
-	self->fetchFirmwareBacklightFrequencyIfNecessary(controller);
+	if (!self->fetchFirmwareBacklightFrequencyIfNecessary(controller) && brightness)
+		return kIOReturnNotReady;
 	
 	// Step 3: Calculate the new duty cycle for the given brightness level
-	uint32_t dutyCycle = self->calcDutyCycle(controller, brightness);
+	const auto divider = self->getFrequencyDivider(controller);
+	uint32_t dutyCycle;
+	if (!self->calcDutyCycle(brightness, divider, dutyCycle))
+		return kIOReturnNotReady;
 	DBGLOG("igfx", "BLT: [KBL ] Frequency = 0x%x, Divider = 0x%x, Duty Cycle = 0x%x.",
-		   self->firmwareBacklightFrequency, self->getFrequencyDivider(controller), dutyCycle);
+		   self->firmwareBacklightFrequency, divider, dutyCycle);
 	
 	// Step 4: Write the PWM frequency set by the system firmware to BXT_BLC_PWM_FREQ1
 	self->writeFrequency(controller, brightness == 0 ? 0 : self->firmwareBacklightFrequency);
@@ -1193,12 +1203,16 @@ IOReturn IGFX::BacklightRegistersAltFixCFL::wrapHwSetBacklight(void *controller,
 	
 	// Step 1: Fetch and preserve the PWM frequency set by the system firmware
 	//         Note that we need to restore the frequency after the system wakes up
-	self->fetchFirmwareBacklightFrequencyIfNecessary(controller);
+	if (!self->fetchFirmwareBacklightFrequencyIfNecessary(controller) && brightness)
+		return kIOReturnNotReady;
 	
 	// Step 2: Calculate the new duty cycle for the given brightness level
-	uint32_t dutyCycle = self->calcDutyCycle(controller, brightness);
+	const auto divider = self->getFrequencyDivider(controller);
+	uint32_t dutyCycle;
+	if (!self->calcDutyCycle(brightness, divider, dutyCycle))
+		return kIOReturnNotReady;
 	DBGLOG("igfx", "BLT: [CFL ] Frequency = 0x%x, Divider = 0x%x, Duty Cycle = 0x%x.",
-		   self->firmwareBacklightFrequency, self->getFrequencyDivider(controller), dutyCycle);
+		   self->firmwareBacklightFrequency, divider, dutyCycle);
 	
 	// Step 3: Write the PWM frequency set by the system firmware to BXT_BLC_PWM_FREQ1
 	self->writeFrequency(controller, self->firmwareBacklightFrequency);
@@ -1235,30 +1249,37 @@ bool BrightnessRequestEventSource::checkForWork() {
 	
 	// Get a pending request
 	// No work if the queue is empty
-	BrightnessRequest request = smoother->request; // TODO: read it atomically, or compare the whole requests instead of ID
-	if (!request.controller) {
+	auto irq = IOSimpleLockLockDisableInterrupt(smoother->requestLock);
+	BrightnessRequest request = smoother->request;
+	uint32_t current = request.controller ? IGFX::callbackIGFX->readRegister32(request.controller, request.address) : 0;
+	const bool unreadable = current == UINT32_MAX && request.mask == UINT32_MAX;
+	if (unreadable)
+		smoother->request.controller = nullptr;
+	IOSimpleLockUnlockEnableInterrupt(smoother->requestLock, irq);
+	if (!request.controller || unreadable) {
 		DBGLOG("igfx", "BLS: [COMM] The request is empty. Will wait for the next invocation.");
 		return false;
 	}
 	
 	// Prepare the request
 	[[maybe_unused]] uint64_t snanosecs = getCurrentTimeNs();
-	uint32_t current = IGFX::callbackIGFX->readRegister32(request.controller, request.address);
 	uint32_t cbrightness = request.getCurrentBrightness(current);
 	uint32_t tbrightness = request.getTargetBrightness();
-	// Zero means "backlight off" (display or system sleep) and is honoured as is: raising it to the
-	// lower bound kept the backlight on. submitRequest() has already written it to the register.
-	if (tbrightness != 0) {
-		tbrightness = max(tbrightness, smoother->brightnessRange.first);
-		tbrightness = min(tbrightness, smoother->brightnessRange.second);
-		tbrightness = min(tbrightness, request.mask); // Limit the brightness to the width of the duty field.
-	}
+	// Off is committed by the submitter; only nonzero requests reach the worker.
+	tbrightness = max(tbrightness, smoother->brightnessRange.first);
+	tbrightness = min(tbrightness, smoother->brightnessRange.second);
+	tbrightness = min(tbrightness, request.mask); // Limit the brightness to the width of the duty field.
 	uint32_t target = request.getTargetRegisterValue(tbrightness);
 
 	// A packed PWM register can change frequency while its duty field stays the same.
 	if (current == target) {
 		DBGLOG("igfx", "BLS: [COMM] The request is already completed. Will wait for the next invocation.");
-		return smoother->request.id != request.id;
+		auto state = IOSimpleLockLockDisableInterrupt(smoother->requestLock);
+		bool changed = smoother->request.id != request.id;
+		if (!changed)
+			smoother->request.controller = nullptr;
+		IOSimpleLockUnlockEnableInterrupt(smoother->requestLock, state);
+		return changed;
 	}
 	
 	uint32_t distance = max(cbrightness, tbrightness) - min(cbrightness, tbrightness);
@@ -1270,23 +1291,21 @@ bool BrightnessRequestEventSource::checkForWork() {
 		for (uint32_t i = 1; i < smoother->steps; i++) {
 			uint32_t offset = static_cast<uint32_t>(static_cast<uint64_t>(i) * distance / smoother->steps);
 			uint32_t value = cbrightness < tbrightness ? cbrightness + offset : cbrightness - offset;
-			IGFX::callbackIGFX->writeRegister32(request.controller, request.address, request.getTargetRegisterValue(value));
+			if (!smoother->writeIfCurrent(request, request.getTargetRegisterValue(value), false))
+				return true;
 			IOSleep(smoother->interval);
-			if (smoother->request.id != request.id) {
-				return true; // Start again, because there is a new request
-			}
 		}
 	} else {
 		DBGLOG("igfx", "BLS: [COMM] Distance is too short. Will set the target value directly.");
 	}
 	
 	// Finish by writing the target value
-	IGFX::callbackIGFX->writeRegister32(request.controller, request.address, target);
+	bool completed = smoother->writeIfCurrent(request, target, true);
 	[[maybe_unused]] uint64_t enanosecs = getCurrentTimeNs();
 	DBGLOG("igfx", "BLS: [COMM] The request completed in %llu nanoseconds.", enanosecs - snanosecs);
 	
 	// No need to invoke this function again if the request is the same
-	return smoother->request.id != request.id;
+	return !completed;
 }
 
 /**
@@ -1325,12 +1344,17 @@ void IGFX::BacklightSmoother::deinit() {
 	// `BacklightSmoother::processKernel()` guarantees that all pointers are nullptr on failure
 	if (workloop != nullptr) {
 		if (eventSource != nullptr) {
-			workloop->removeEventSource(eventSource);
+			if (eventSource->getWorkLoop())
+				workloop->removeEventSource(eventSource);
 			OSSafeReleaseNULL(eventSource);
 		}
 		OSSafeReleaseNULL(workloop);
 	}
 	OSSafeReleaseNULL(owner);
+	if (requestLock) {
+		IOSimpleLockFree(requestLock);
+		requestLock = nullptr;
+	}
 }
 
 void IGFX::BacklightSmoother::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
@@ -1372,6 +1396,12 @@ void IGFX::BacklightSmoother::processKernel(KernelPatcher &patcher, DeviceInfo *
 		brightnessRange.second = UINT32_MAX;
 	}
 	
+	requestLock = IOSimpleLockAlloc();
+	if (!requestLock) {
+		enabled = false;
+		return;
+	}
+
 	// Wrap this submodule as an OSObject
 	owner = OSObjectWrapper::with(this);
 	if (owner == nullptr) {
@@ -1407,6 +1437,8 @@ void IGFX::BacklightSmoother::processKernel(KernelPatcher &patcher, DeviceInfo *
 		SYSLOG("igfx", "BLS: Failed to register the request event source.");
 		deinit();
 		enabled = false;
+	} else {
+		eventSource->enable();
 	}
 }
 
@@ -1417,26 +1449,55 @@ void IGFX::BacklightSmoother::processFramebufferKext(KernelPatcher &patcher, siz
 		callbackIGFX->modMMIORegistersWriteSupport.replacerList.add(&dIVBPWMCCTRL);
 	} else if (framebuffer.isOneOf(&kextIntelAzulFb, &kextIntelBDWFb, &kextIntelSKLFb, &kextIntelKBLFb)) {
 		DBGLOG("igfx", "BLS: [HSW+] Will setup the smoother for HSW/BDW/SKL/KBL platform.");
+		callbackIGFX->modMMIORegistersWriteSupport.prologueList.add(&dPanelControl);
 		callbackIGFX->modMMIORegistersWriteSupport.replacerList.add(&dHSWPWMFreq1);
 	} else if (framebuffer.isOneOf(&kextIntelCFLFb, &kextIntelICLLPFb)) {
 		DBGLOG("igfx", "BLS: [CFL+] Will setup the smoother for CFL/ICL platform.");
+		callbackIGFX->modMMIORegistersWriteSupport.prologueList.add(&dPanelControl);
+		callbackIGFX->modMMIORegistersWriteSupport.prologueList.add(&dPanelFrequency);
 		callbackIGFX->modMMIORegistersWriteSupport.replacerList.add(&dCFLPWMDuty1);
 	} else {
 		SYSLOG("igfx", "BLS: [ERR!] Unsupported platforms.");
 	}
 }
 
+// A framebuffer may switch off the PWM generator without submitting zero duty.
+void IGFX::BacklightSmoother::cancelOnPowerOff(void *controller, uint32_t address, uint32_t value) {
+	if (address == BXT_BLC_PWM_CTL1 ? (value & (1U << 31)) != 0 : value != 0)
+		return;
+	auto &self = callbackIGFX->modBacklightSmoother;
+	auto irq = IOSimpleLockLockDisableInterrupt(self.requestLock);
+	if (self.request.controller == controller) {
+		++self.request.id;
+		self.request.controller = nullptr;
+	}
+	IOSimpleLockUnlockEnableInterrupt(self.requestLock, irq);
+}
+
+bool IGFX::BacklightSmoother::writeIfCurrent(const BrightnessRequest &active, uint32_t value, bool final) {
+	auto irq = IOSimpleLockLockDisableInterrupt(requestLock);
+	bool current = request.id == active.id && request.controller == active.controller;
+	if (current) {
+		callbackIGFX->writeRegister32(active.controller, active.address, value);
+		if (final)
+			request.controller = nullptr;
+	}
+	IOSimpleLockUnlockEnableInterrupt(requestLock, irq);
+	return current;
+}
+
 void IGFX::BacklightSmoother::submitRequest(void *controller, uint32_t address, uint32_t value, uint32_t mask) {
 	auto &smoother = callbackIGFX->modBacklightSmoother;
-	BrightnessRequest request(smoother.request.id + 1, controller, address, value, mask);
-	if (request.getTargetBrightness() == 0) {
-		// Turning the backlight off (display or system sleep) is written right away. Fading it out on the
-		// workloop raced the panel power-off sequence, which then went on while PWM writes were still pending.
+	auto irq = IOSimpleLockLockDisableInterrupt(smoother.requestLock);
+	smoother.request = BrightnessRequest(smoother.request.id + 1, controller, address, value, mask);
+	const bool off = (value & mask) == 0;
+	if (off) {
+		smoother.request.controller = nullptr;
 		callbackIGFX->writeRegister32(controller, address, value);
 	}
-	// Still queue it: a fade in progress sees the new id and stops, and the event source finds it done.
-	smoother.request = request;
-	smoother.eventSource->enable();
+	IOSimpleLockUnlockEnableInterrupt(smoother.requestLock, irq);
+	if (!off)
+		smoother.eventSource->notify();
 }
 
 void IGFX::BacklightSmoother::smoothIVBWriteRegisterPWMCCTRL(void *controller, uint32_t address, uint32_t value) {

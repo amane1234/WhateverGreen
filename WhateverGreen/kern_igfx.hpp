@@ -588,7 +588,7 @@ private:
 		/**
 		 *  Get the framebuffer controller at the given index
 		 */
-		AppleIntelFramebufferController *getController(size_t index) { return controllers[index]; }
+		AppleIntelFramebufferController *getController(size_t index) { return controllers ? controllers[index] : nullptr; }
 		
 		// MARK: Patch Submodule IMP
 		void init() override;
@@ -1283,7 +1283,12 @@ private:
 	 *  A submodule that patches RPS control for all command streamers
 	 */
 	class RPSControlPatch: public PatchSubmodule {
-		uint32_t freq_max {0};
+		// The fused RP limits belong to the built-in GPU and survive power transitions.
+		uint32_t rpCaps {0};
+		uint32_t readCaps(void *controller);
+		bool sustainedSubmissions(uint64_t now);
+		bool samplingLoad {false};
+		uint64_t burstStart {0};
 
 		/**
 		 *  rps-control mode: 1 boosts to RP0 only while command submissions arrive back to back (busy GPU),
@@ -1316,8 +1321,15 @@ private:
 		uint64_t rc6LastRestore {0};
 		uint64_t rc6NextStallReport {0};
 		void *rc6LogCall {nullptr};
-		uint32_t rc6Events {0};
-		uint32_t rc6LogValue[3] {};
+		// Only the sampler may access the snapshot. Bit 1 permanently closes admission.
+		uint32_t rc6Sampler {0};
+		struct Event { uint32_t kind, v0, v1, v2; };
+		Event logQueue[8] {};
+		unsigned logHead {0}, logCount {0};
+		bool logScheduled {false};
+		IOSimpleLock *logLock {nullptr};
+		void sampleRC6(uint64_t now);
+		void reportEvent(const Event &event);
 		void checkRC6();
 
 		/**
@@ -1350,9 +1362,11 @@ private:
 		 *  True if this fix is available for the current Intel platform
 		 */
 		bool available {false};
+		~RPSControlPatch() override { deinit(); }
 		
 		// MARK: Patch Submodule IMP
 		void init() override;
+		void deinit() override;
 		void processKernel(KernelPatcher &patcher, DeviceInfo *info) override;
 		void processFramebufferKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) override;
 		void processGraphicsKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) override;
@@ -1362,9 +1376,11 @@ private:
 	 *  A submodule that fixes the kernel panic due to a rare force wake timeout on KBL and CFL platforms.
 	 */
 	class ForceWakeWorkaround: public PatchSubmodule {
-		static bool pollRegister(uint32_t, uint32_t, uint32_t, uint32_t);
-		static bool forceWakeWaitAckFallback(uint32_t, uint32_t, uint32_t);
-		static void forceWake(void *, uint8_t set, uint32_t dom, uint32_t);
+		void (*orgForceWake)(void *, bool, uint32_t, uint32_t) {nullptr};
+		uint32_t fallbackDomains {0};
+		static bool pollRegister(void *controller, uint32_t reg, uint32_t val, uint32_t mask, uint64_t deadline);
+		static bool forceWakeWaitAckFallback(void *controller, uint32_t domain, uint32_t val, uint32_t mask);
+		static void forceWake(void *, bool set, uint32_t dom, uint32_t);
 		
 	public:
 		// MARK: Patch Submodule IMP
@@ -1910,10 +1926,13 @@ private:
 		 *
 		 *  @param controller The framebuffer controller instance
 		 */
-		void fetchFirmwareBacklightFrequencyIfNecessary(void *controller) {
+		bool fetchFirmwareBacklightFrequencyIfNecessary(void *controller) {
 			if (this->firmwareBacklightFrequency == 0) {
 				// Guard: The system should be initialized with a non-zero PWM frequency
-				if (auto bootValue = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_FREQ1); bootValue != 0) {
+				auto bootValue = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_FREQ1);
+				if (bootValue == UINT32_MAX)
+					return false;
+				if (bootValue) {
 					DBGLOG("igfx", "BLT: [COMM] System initialized with a PWM frequency of 0x%x.", bootValue);
 					this->firmwareBacklightFrequency = bootValue;
 				} else {
@@ -1921,6 +1940,7 @@ private:
 					this->firmwareBacklightFrequency = kFallbackBacklightFrequency;
 				}
 			}
+			return true;
 		}
 		
 		/**
@@ -1946,14 +1966,19 @@ private:
 		/**
 		 *  Calculate the duty cycle for the given brightness level
 		 *
-		 *  @param controller The framebuffer controller instance
-		 *  @param brightness The new brightness level
-		 *  @return The duty cycle that will be written to the register `BXT_BLC_PWM_DUTY1`
+		 *  @param brightness The requested level. Zero always turns the panel off.
+		 *  @param divider The sampled framebuffer divider
+		 *  @param duty Receives the scaled PWM duty on success
 		 */
-		uint32_t calcDutyCycle(void *controller, uint32_t brightness) const {
-			uint64_t frequency = this->firmwareBacklightFrequency;
-			uint64_t divider = this->getFrequencyDivider(controller);
-			return static_cast<uint32_t>(frequency * brightness / divider);
+		bool calcDutyCycle(uint32_t brightness, uint32_t divider, uint32_t &duty) const {
+			duty = 0;
+			if (!brightness)
+				return true;
+			if (!divider || divider == UINT32_MAX)
+				return false;
+			uint32_t level = brightness < divider ? brightness : divider;
+			duty = static_cast<uint32_t>(static_cast<uint64_t>(firmwareBacklightFrequency) * level / divider);
+			return true;
 		}
 		
 		/**
@@ -2063,11 +2088,15 @@ private:
 		 *
 		 *  @param controller The framebuffer controller instance
 		 */
-		void fetchFirmwareBacklightControlIfNecessary(void *controller) {
+		bool fetchFirmwareBacklightControlIfNecessary(void *controller) {
 			if (this->firmwareBacklightControl == 0) {
-				this->firmwareBacklightControl = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_CTL1);
+				auto value = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_CTL1);
+				if (value == UINT32_MAX)
+					return false;
+				this->firmwareBacklightControl = value;
 				DBGLOG("igfx", "BLT: [KBL ] System initialized with a PWM control value of 0x%x.", this->firmwareBacklightControl);
 			}
+			return true;
 		}
 		
 		/**
@@ -2294,6 +2323,8 @@ private:
 		 *  A list of pending brightness adjustment requests
 		 */
 		BrightnessRequest request;
+		IOSimpleLock *requestLock {nullptr};
+		bool writeIfCurrent(const BrightnessRequest &active, uint32_t value, bool final);
 
 		/**
 		 *  A workloop that provides a kernel thread to adjust the brightness
@@ -2334,6 +2365,9 @@ private:
 		/**
 		 *  [IVB ] A replacer descriptor that injects code when the register of interest is BLC_PWM_CPU_CTL
 		 */
+		static void cancelOnPowerOff(void *controller, uint32_t address, uint32_t value);
+		MMIOWriteInjectionDescriptor dPanelControl {BXT_BLC_PWM_CTL1, cancelOnPowerOff};
+		MMIOWriteInjectionDescriptor dPanelFrequency {BXT_BLC_PWM_FREQ1, cancelOnPowerOff};
 		MMIOWriteInjectionDescriptor dIVBPWMCCTRL {BLC_PWM_CPU_CTL,   smoothIVBWriteRegisterPWMCCTRL};
 
 		/**
