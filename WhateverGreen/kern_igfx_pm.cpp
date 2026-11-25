@@ -540,6 +540,12 @@ void IGFX::RPSControlPatch::checkRC6() {
 }
 
 void IGFX::RPSControlPatch::sampleTelemetry(void *controller) {
+	// Like the RC6 monitor, read the GT residency counter only while the render well is awake. Asleep it
+	// reads as 0: two such reads in a row would publish a valid-looking 0 permille while the GT was in RC6,
+	// and one would replace the baseline. Skip the sample and keep the previous baseline instead.
+	const uint32_t ack = callbackIGFX->readRegister32(controller, FORCEWAKE_ACK_RENDER_GEN9);
+	if (ack == UINT32_MAX || !(ack & 0xFFFF))
+		return;
 	uint32_t ticks = callbackIGFX->readRegister32(controller, GEN6_GT_GFX_RC6);
 	const uint64_t now = mach_absolute_time();
 	uint64_t uptime = 0, elapsed = 0;

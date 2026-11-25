@@ -123,6 +123,7 @@ Read [FAQs](./Manual/) and avoid asking any questions. No support is provided fo
 | `igfxrpsc=1` 		 	| `rps-control` property on IGPU 	| Enable RPS control patch (improves IGPU performance). `1` boosts to the maximum frequency only under sustained load, `2` always requests the maximum frequency (old behaviour, can keep the GPU at maximum clock after S3/S4 sleep) 	|
 | `igfxgtfloor=MHz` 		| `gt-floor-freq` property on IGPU 	| With Apple GuC (`igfxfw=2`), cap the GPU minimum frequency that AGPM requests (e.g. 500 MHz) at the given value. Values at or below the hardware minimum give the hardware minimum (e.g. `igfxgtfloor=300`). KBL and CFL framebuffers only 	|
 | `-igfxrc6fix` 		 	| `enable-rc6-fix` property on IGPU 	| Restore the RC6 (GPU idle power state) configuration when it is lost, e.g. after S3/S4 sleep, and log RC6 problems (`igfx_pm` in the kernel log). SKL/KBL/CFL/CML only 	|
+| `igfxpwr=MASK` 		 	| N/A 	| **Experimental.** Power diagnostics and display power policy requests for a display-connected KBL/CFL/CML iGPU, off by default. Bits: `1` observe (RC6 residency, ForceWake requests and display registers the framebuffer already reads, published as `weg-power-*` IGPU properties), `2` request native FBC and dynamic FBC, `4` request native dynamic CDCLK, `8` HWP-EPP-aware limit on the `igfxrpsc=1` boost (includes observation). Try one policy change per boot. [Read the manual](./Manual/IntelPowerExperiments.md) 	|
 | `igfxsnb=0` 		  | N/A 	| Disable IntelAccelerator name fix for Sandy Bridge CPUs 	|
 
 ##### Backlight
