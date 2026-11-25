@@ -1252,24 +1252,29 @@ bool BrightnessRequestEventSource::checkForWork() {
 	auto irq = IOSimpleLockLockDisableInterrupt(smoother->requestLock);
 	BrightnessRequest request = smoother->request;
 	uint32_t current = request.controller ? IGFX::callbackIGFX->readRegister32(request.controller, request.address) : 0;
-	const bool unreadable = current == UINT32_MAX && request.mask == UINT32_MAX;
-	if (unreadable)
-		smoother->request.controller = nullptr;
 	IOSimpleLockUnlockEnableInterrupt(smoother->requestLock, irq);
-	if (!request.controller || unreadable) {
+	if (!request.controller) {
 		DBGLOG("igfx", "BLS: [COMM] The request is empty. Will wait for the next invocation.");
 		return false;
 	}
-	
+
 	// Prepare the request
 	[[maybe_unused]] uint64_t snanosecs = getCurrentTimeNs();
-	uint32_t cbrightness = request.getCurrentBrightness(current);
 	uint32_t tbrightness = request.getTargetBrightness();
 	// Off is committed by the submitter; only nonzero requests reach the worker.
 	tbrightness = max(tbrightness, smoother->brightnessRange.first);
 	tbrightness = min(tbrightness, smoother->brightnessRange.second);
 	tbrightness = min(tbrightness, request.mask); // Limit the brightness to the width of the duty field.
 	uint32_t target = request.getTargetRegisterValue(tbrightness);
+
+	// All ones means the register did not answer (the display engine is powered down or resuming). There
+	// is no valid starting point for a fade: with a packed PWM register the duty field would read as full
+	// brightness and the panel would flash. Apply the target in one write instead of dropping the request.
+	if (current == UINT32_MAX) {
+		DBGLOG("igfx", "BLS: [COMM] The register is unreadable. Will set the target value directly.");
+		return !smoother->writeIfCurrent(request, target, true);
+	}
+	uint32_t cbrightness = request.getCurrentBrightness(current);
 
 	// A packed PWM register can change frequency while its duty field stays the same.
 	if (current == target) {

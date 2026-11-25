@@ -12,6 +12,12 @@
 - Added `igfxgtfloor=MHz` (`gt-floor-freq`) to lower the minimum GPU frequency AGPM sets with Apple GuC (`igfxfw=2`), e.g. back from 500 MHz to the hardware minimum
 - Added `-igfxrc6fix` (`enable-rc6-fix`) to restore the RC6 configuration when it is lost after S3/S4 sleep and to report a stuck RC6 residency (e.g. a leaked forcewake reference)
 - Fixed framebuffer patches reading and writing past the framebuffer region and leaking skipped patch data
+- Fixed the backlight smoother racing the framebuffer: requests are now taken and finished under a lock, a fade stops as soon as the panel PWM is switched off, and stale steps are never written over a newer request
+- Fixed the backlight smoother dropping a request or fading from full brightness when the PWM register reads back as all ones (display engine still powered down); the target is now written directly
+- Fixed the alternative backlight fixes and register fixes accepting all-ones register reads as the firmware PWM frequency/control, and duty cycles above the frequency
+- RPS control reads the fused RP limits once and caches them; `igfxrpsc=1` now boosts only when submissions stay close together for a full sampling window
+- RC6 events are queued instead of overwriting each other, RC6 restores re-check the live configuration and the force-wake ACK before every write, and the monitor shuts down cleanly
+- Force wake no longer panics after an ACK timeout: the request falls back to Apple's routine; the fallback bit is shared safely between contexts and polling backs off without sleeping
 
 #### v1.7.0
 - Added constants for macOS 26 support
