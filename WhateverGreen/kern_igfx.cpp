@@ -205,8 +205,10 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 			powerOptions = options;
 			powerFramebufferId = info->reportedFramebufferId;
 			if (!framebufferPatchFlags.bits.FPFFlags) {
-				// FBC and dynamic FBC are separate bits so a problem can be traced to one of them
-				if (options & RequestFBC) {
+				// Bit 256 alone remains an observation option. Keep testing the dynamic
+				// path independent of forcing base FBC in the same boot.
+				const bool dynamic = (options & RequestDynamicFBC) && checkKernelArgument("-igfxdynfbc");
+				if ((options & RequestFBC) || dynamic) {
 					if (WIOKit::awaitPublishing(info->videoBuiltin)) {
 						auto raw = WIOKit::readPCIConfigValue(info->videoBuiltin, WIOKit::kIOPCIConfigGraphicsControl, 0, 16);
 						auto gms = (raw >> 8) & 0xff;
@@ -221,10 +223,14 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 							stolenMB = (gms - 0xef) * 4;
 						info->videoBuiltin->setProperty("weg-fbc-gms-raw", gms, 32);
 					}
-					powerFlagMask |= 0x4; // FBFramebufferCompression
+					if (options & RequestFBC)
+						powerFlagMask |= BaseFBCFlag;
+					else if (dynamic)
+						powerFlagMask |= DynamicFBCFlag;
 				}
 				if (options & RequestDynamicFBC)
-					info->videoBuiltin->setProperty("weg-dynamic-fbc-policy", "native only");
+					info->videoBuiltin->setProperty("weg-dynamic-fbc-policy",
+						!dynamic ? "native only" : (options & RequestFBC) ? "skipped: base FBC also requested" : "check framebuffer");
 				if (options & RequestCDCLK)
 					powerFlagMask |= 0x200000; // FBEnableDynamicCDCLK
 			}
@@ -377,7 +383,7 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 				submodule->processFramebufferKext(patcher, index, address, size);
 
 		if (applyFramebufferPatch || dumpFramebufferToDisk || dumpPlatformTable || hdmiAutopatch || powerFlagMask) {
-			powerKblLayout = getRealFramebuffer(index) == &kextIntelKBLFb;
+			kblFramebufferLayout = getRealFramebuffer(index) == &kextIntelKBLFb;
 			framebufferStart = reinterpret_cast<uint8_t *>(address);
 			framebufferSize = size;
 			
@@ -1247,19 +1253,37 @@ void IGFX::applyPowerFlags(IOService *controller) {
 			if (frame->framebufferId == UINT32_MAX && frame->pad == 0) {
 				if (match) {
 					uint32_t mask = powerFlagMask;
-					if (mask & 4) {
+					if (mask & (BaseFBCFlag | DynamicFBCFlag)) {
 						// The FAQ's TOTAL STOLEN (the DVMT a platform needs) is the per-framebuffer stolen memory, not
 						// stolen x FBMemoryCount: that product is MAX STOLEN, with every pipe active, and exceeds a
 						// typical 64 MB DVMT on most mobile entries. Add the boot framebuffer memory to stay conservative.
 						uint64_t required = static_cast<uint64_t>(match->fStolenMemorySize) + match->fFramebufferMemorySize;
-						if (!match->fStolenMemorySize || !stolenMB || required > (static_cast<uint64_t>(stolenMB) << 20))
-							mask &= ~4U;
+						const bool budgetOK = match->fStolenMemorySize && stolenMB && required <= (static_cast<uint64_t>(stolenMB) << 20);
+						if (mask & DynamicFBCFlag) {
+							const auto &panel = match->connectors[0];
+							const char *reason = nullptr;
+							if (match->flags.value & DynamicFBCFlag)
+								reason = "already set in platform flags";
+							else if (!(match->flags.value & BaseFBCFlag))
+								reason = "skipped: platform FBC flag absent";
+							else if (!budgetOK)
+								reason = "skipped: DVMT insufficient or unknown";
+							else if (match->fPortCount > arrsize(match->connectors) || !match->fPipeCount ||
+								!match->fFBMemoryCount || panel.index != 0 || panel.type != ConnectorLVDS)
+								reason = "skipped: internal panel layout unconfirmed";
+							if (reason)
+								mask &= ~DynamicFBCFlag;
+							controller->setProperty("weg-dynamic-fbc-result", reason ? reason : "requested in platform flags");
+						}
+						if (!budgetOK)
+							mask &= ~BaseFBCFlag;
 						controller->setProperty("weg-fbc-dvmt-mb", stolenMB, 32);
 						controller->setProperty("weg-fbc-required-mb", static_cast<uint32_t>((required + 0xfffff) >> 20), 32);
-						controller->setProperty("weg-fbc-platform-budget-ok", static_cast<uint32_t>((mask & 4) != 0), 32);
+						controller->setProperty("weg-fbc-platform-budget-ok", static_cast<uint32_t>(budgetOK), 32);
 					}
 					uint32_t flags = match->flags.value | mask;
-					match->flags.value = flags;
+					if (mask && match->flags.value != flags)
+						match->flags.value = flags;
 					controller->setProperty("weg-power-framebuffer-flags", flags, 32);
 					return true;
 				}
@@ -1275,8 +1299,10 @@ void IGFX::applyPowerFlags(IOService *controller) {
 		}
 		return false;
 	};
-	bool applied = powerKblLayout ? apply(static_cast<FramebufferSKL *>(gPlatformInformationList)) :
+	bool applied = kblFramebufferLayout ? apply(static_cast<FramebufferSKL *>(gPlatformInformationList)) :
 		apply(static_cast<FramebufferCFL *>(gPlatformInformationList));
+	if (!applied && (powerFlagMask & DynamicFBCFlag))
+		controller->setProperty("weg-dynamic-fbc-result", "skipped: no unique platform entry");
 	controller->setProperty("weg-power-framebuffer-matched", static_cast<uint32_t>(applied), 32);
 }
 
@@ -2005,12 +2031,9 @@ void IGFX::applyFramebufferPatches() {
 		else if (cpuGeneration == CPUInfo::CpuGeneration::Broadwell)
 			success = applyPlatformInformationListPatch(framebufferId, static_cast<FramebufferBDW *>(gPlatformInformationList));
 		else if (cpuGeneration == CPUInfo::CpuGeneration::Skylake || cpuGeneration == CPUInfo::CpuGeneration::KabyLake ||
-				 (cpuGeneration == CPUInfo::CpuGeneration::CoffeeLake && static_cast<FramebufferSKL *>(gPlatformInformationList)->framebufferId == 0x591E0000))
-			//FIXME: write this in a nicer way (coffee pretending to be Kaby, detecting via first kaby frame)
+				 kblFramebufferLayout)
 			success = applyPlatformInformationListPatch(framebufferId, static_cast<FramebufferSKL *>(gPlatformInformationList));
-		else if (cpuGeneration == CPUInfo::CpuGeneration::CoffeeLake)
-			success = applyPlatformInformationListPatch(framebufferId, static_cast<FramebufferCFL *>(gPlatformInformationList));
-		else if (cpuGeneration == CPUInfo::CpuGeneration::CometLake)
+		else if (cpuGeneration == CPUInfo::CpuGeneration::CoffeeLake || cpuGeneration == CPUInfo::CpuGeneration::CometLake)
 			success = applyPlatformInformationListPatch(framebufferId, static_cast<FramebufferCFL *>(gPlatformInformationList));
 		else if (cpuGeneration == CPUInfo::CpuGeneration::CannonLake)
 			success = applyPlatformInformationListPatch(framebufferId, static_cast<FramebufferCNL *>(gPlatformInformationList));
@@ -2093,11 +2116,9 @@ void IGFX::applyHdmiAutopatch() {
 	else if (cpuGeneration == CPUInfo::CpuGeneration::Broadwell)
 		success = applyDPtoHDMIPatch(framebufferId, static_cast<FramebufferBDW *>(gPlatformInformationList));
 	else if (cpuGeneration == CPUInfo::CpuGeneration::Skylake || cpuGeneration == CPUInfo::CpuGeneration::KabyLake ||
-			 (cpuGeneration == CPUInfo::CpuGeneration::CoffeeLake && static_cast<FramebufferSKL *>(gPlatformInformationList)->framebufferId == 0x591E0000))
+			 kblFramebufferLayout)
 		success = applyDPtoHDMIPatch(framebufferId, static_cast<FramebufferSKL *>(gPlatformInformationList));
-	else if (cpuGeneration == CPUInfo::CpuGeneration::CoffeeLake)
-		success = applyDPtoHDMIPatch(framebufferId, static_cast<FramebufferCFL *>(gPlatformInformationList));
-	else if (cpuGeneration == CPUInfo::CpuGeneration::CometLake)
+	else if (cpuGeneration == CPUInfo::CpuGeneration::CoffeeLake || cpuGeneration == CPUInfo::CpuGeneration::CometLake)
 		success = applyDPtoHDMIPatch(framebufferId, static_cast<FramebufferCFL *>(gPlatformInformationList));
 	else if (cpuGeneration == CPUInfo::CpuGeneration::CannonLake)
 		success = applyDPtoHDMIPatch(framebufferId, static_cast<FramebufferCNL *>(gPlatformInformationList));

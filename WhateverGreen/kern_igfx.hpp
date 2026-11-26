@@ -213,7 +213,8 @@ private:
 	};
 	uint32_t powerOptions {0};
 	uint32_t powerFramebufferId {0};
-	bool powerKblLayout {false};
+	bool kblFramebufferLayout {false};
+	static constexpr uint32_t BaseFBCFlag = 0x4, DynamicFBCFlag = 0x10;
 	uint32_t powerFlagMask {0}, stolenMB {0};
 	void applyPowerFlags(IOService *controller);
 

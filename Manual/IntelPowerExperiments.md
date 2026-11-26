@@ -29,7 +29,7 @@ Add the `igfxpwr` values to combine them. Try one policy change per boot. The di
 ## Properties set once at boot
 
 * `weg-power-framebuffer-matched` and `weg-power-framebuffer-flags`: the Apple controller found the selected platform entry, and its flags after the request.
-* FBC check: the request is added only when the DVMT (GMS field of the GPU's GGC register) holds the selected entry's stolen memory plus its boot framebuffer memory, the FAQ's TOTAL STOLEN (slightly conservative). Stolen memory times `FBMemoryCount` is the all-pipes MAX STOLEN and is not required. `weg-fbc-gms-raw`, `weg-fbc-dvmt-mb`, `weg-fbc-required-mb` and `weg-fbc-platform-budget-ok` report the check; a DVMT of 0 means the GMS value was not recognized and the FBC request was dropped. Dynamic FBC stays under native policy (`weg-dynamic-fbc-policy`).
+* FBC check: the request is added only when the DVMT (GMS field of the GPU's GGC register) holds the selected entry's stolen memory plus its boot framebuffer memory, the FAQ's TOTAL STOLEN (slightly conservative). Stolen memory times `FBMemoryCount` is the all-pipes MAX STOLEN and is not required. `weg-fbc-gms-raw`, `weg-fbc-dvmt-mb`, `weg-fbc-required-mb` and `weg-fbc-platform-budget-ok` report the check; a DVMT of 0 means the GMS value was not recognized and the FBC request was dropped. By default dynamic FBC stays under native policy (`weg-dynamic-fbc-policy`).
 * `weg-rps-control-mode`, `weg-power-psr-policy`, `weg-power-dc-policy` and `weg-power-native-modeset` confirm the selected modes.
 * `-igfxrc6fix` keeps its `weg-rc6-*` status properties, which change only on RC6 events.
 
@@ -68,8 +68,14 @@ Modes 3–5 sample the RP busy or down-idle counters immediately before a native
 
 `-igfxrc6fix` now reports RC_CONTROL as observed through native framebuffer reads. Recovery writes belong to the Apple driver. The readback is tagged with a reset generation and invalidated at known wake boundaries. A missing native read leaves the status pending. With explicit observation, `weg-power-last-gt-release-ack` records the last observed GT ACK before release. It does not measure hold duration.
 
-DC5/DC6 properties count transitions. No verified DC dwell-time source is available. With explicit observation and `-igfxfreqprofile`, native RPSTAT1 reads feed 32 little-endian UInt64 buckets in `weg-gt-50mhz-bins-ms` (50 MHz each, the last includes 1550 MHz and above). No extra GT read is issued. Equal-band endpoints within 250 ms contribute to `weg-gt-frequency-covered-ms`. Compare that value with `weg-gt-frequency-window-ms`, the elapsed time between native observations within recorded wake/reset epochs. Reads made outside the framebuffer hook are invisible, so an empty histogram is possible. Dynamic FBC stays under native policy pending a symbolicated panic trace.
+DC5/DC6 properties count transitions. No verified DC dwell-time source is available. With explicit observation and `-igfxfreqprofile`, native RPSTAT1 reads feed 32 little-endian UInt64 buckets in `weg-gt-50mhz-bins-ms` (50 MHz each, the last includes 1550 MHz and above). No extra GT read is issued. Equal-band endpoints within 250 ms contribute to `weg-gt-frequency-covered-ms`. Compare that value with `weg-gt-frequency-window-ms`, the elapsed time between native observations within recorded wake/reset epochs. Reads made outside the framebuffer hook are invisible, so an empty histogram is possible. The cause of the earlier dynamic FBC panic remains unconfirmed.
 
 With `-igfxbls`, a one-shot timer schedules each fade step on the existing workloop, identical pending nonzero requests are coalesced, and screen-off is executed immediately.
 
 The PWM start value is sampled by the submitter outside the request spinlock. Ordered commits and immediate zero-duty writes still use that lock.
+
+## Experimental dynamic FBC request
+
+Start with `igfxpwr=256` to observe the native framebuffer. To test the dynamic flag, use `igfxpwr=256 -igfxdynfbc`. Remove `-igfxdynfbc` and reboot to restore observation alone. An explicit framebuffer-flags override takes precedence. Combining the test with the base FBC request (bit 2) suppresses the extra dynamic flag.
+
+The opt-in adds only bit 0x10 to the selected platform entry before native framebuffer setup. It requires existing base FBC in the effective flags, a recognized sufficient DVMT budget and a port-zero LVDS/eDP layout with framebuffer memory slots and pipes. `weg-dynamic-fbc-result` on the framebuffer controller records the decision. A request confirms only the table setting. Native `weg-power-fbc-enabled` and `weg-power-fbc-compressing` observations describe FBC activity and cannot distinguish dynamic switching. These preconditions cannot validate Apple's internal allocations or exclude the earlier panic.
