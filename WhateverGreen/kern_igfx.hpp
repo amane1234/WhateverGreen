@@ -1322,6 +1322,10 @@ private:
 		bool rc6Fix {false};
 		unsigned hardwareBusy(uint64_t now);
 		void refreshPolicy();
+		int externalPower(uint64_t now);
+		// igfxrpsc=5: cached AC state (-1 unknown, 0 battery, 1 AC), only touched by the reporting worker
+		int acState {-1};
+		uint64_t acCheckedAt {0}, acCheckInterval {0}, acEpoch {0};
 		// 0 native, 1 middle tier, 2 maximum. Updated by the reporting worker.
 		uint32_t policyLimit {0}, measuredTier {0};
 		uint64_t policyAt {0}, previousBusySample {0};

@@ -202,6 +202,7 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 	}
 
 	if (mode == 5) {
+		nanoseconds_to_absolutetime(10000000000ULL, &acCheckInterval);
 		uint32_t features = 0, ecx = 0;
 		if (CPUInfo::getCpuid(1, 0, nullptr, nullptr, &ecx) && !(ecx & (1U << 31)) &&
 			CPUInfo::getCpuid(6, 0, &features) && (features & 1)) {
@@ -540,7 +541,7 @@ int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1,
 }
 
 namespace {
-// Result of one igfxrpsc=3/4 sample, counted in busyResults and published with the status
+// Result of one igfxrpsc=3/4/5 sample, counted in busyResults and published with the status
 enum BusyResult : uint32_t {
 	BusySampled, BusyNoController, BusyGTAsleep, BusyRPMode, BusyImplausible, BusyUnchanged, BusyResultCount
 };
@@ -687,26 +688,48 @@ void IGFX::RPSControlPatch::Residency::record(unsigned state, uint64_t now, uint
 	__atomic_store_n(&writing, false, __ATOMIC_RELEASE);
 }
 
-void IGFX::RPSControlPatch::refreshPolicy() {
-	unsigned limit = 0;
+// Look up the AC state at most every 10 s and after each wake: the registry walk is the expensive part.
+// The first power source that reports ExternalConnected wins (other IOPMPowerSource services may not).
+int IGFX::RPSControlPatch::externalPower(uint64_t now) {
+	const uint64_t wake = lastWake ? __atomic_load_n(lastWake, __ATOMIC_RELAXED) : 0;
+	if (acCheckedAt && now - acCheckedAt < acCheckInterval && acEpoch == wake)
+		return acState;
+	acCheckedAt = now;
+	acEpoch = wake;
+	acState = -1;
 	auto dict = IOService::serviceMatching("IOPMPowerSource");
 	auto iter = dict ? IOService::getMatchingServices(dict) : nullptr;
 	OSSafeReleaseNULL(dict);
-	auto battery = iter ? OSDynamicCast(IOService, iter->getNextObject()) : nullptr;
-	auto property = battery ? battery->copyProperty(kIOPMPSExternalConnectedKey) : nullptr;
-	auto ac = OSDynamicCast(OSBoolean, property);
+	while (iter && acState < 0) {
+		auto source = OSDynamicCast(IOService, iter->getNextObject());
+		if (!source)
+			break;
+		auto property = source->copyProperty(kIOPMPSExternalConnectedKey);
+		if (auto ac = OSDynamicCast(OSBoolean, property))
+			acState = ac->isTrue() ? 1 : 0;
+		OSSafeReleaseNULL(property);
+	}
+	OSSafeReleaseNULL(iter);
+	return acState;
+}
+
+void IGFX::RPSControlPatch::refreshPolicy() {
+	unsigned limit = 0;
+	const int ac = externalPower(mach_absolute_time());
 	uint32_t lo = 0, hi = 0;
 	// Read the executing core's digital thermal sensor. Unknown input leaves Apple's request intact.
-	if (ac && thermalMsr && !thermalMsr(0x19c, &lo, &hi) && (lo & (1U << 31))) {
+	if (ac >= 0 && thermalMsr && !thermalMsr(0x19c, &lo, &hi) && (lo & (1U << 31))) {
 		unsigned margin = (lo >> 16) & 0x7f;
 		publish("weg-rps-core-thermal-margin-c", margin);
 		if (!(lo & 1) && margin >= 15)
-			limit = ac->isTrue() && margin >= 25 ? 2 : 1;
+			limit = ac == 1 && margin >= 25 ? 2 : 1;
 	} else {
 		unpublish("weg-rps-core-thermal-margin-c");
 	}
-	OSSafeReleaseNULL(property);
-	OSSafeReleaseNULL(iter);
+	if (ac < 0)
+		publish("weg-rps-power-source", "unknown");
+	else
+		publish("weg-rps-power-source", ac ? "AC" : "battery");
 	__atomic_store_n(&policyLimit, limit, __ATOMIC_RELAXED);
 	__atomic_store_n(&policyAt, mach_absolute_time(), __ATOMIC_RELEASE);
 	publish("weg-rps-policy-tier-limit", limit);
@@ -977,7 +1000,7 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 	for (unsigned i = 0; i < 2; ++i) {
 		auto active = __atomic_load_n(&psrProfile[i].ns[1], __ATOMIC_RELAXED);
 		auto other = __atomic_load_n(&psrProfile[i].ns[0], __ATOMIC_RELAXED);
-		if (active || other) {
+		if (igpu && (active || other)) {
 			igpu->setProperty(i ? "weg-psr2-deep-ms" : "weg-psr1-bufoff-ms", active / 1000000, 64);
 			igpu->setProperty(i ? "weg-psr2-covered-ms" : "weg-psr1-covered-ms", (active + other) / 1000000, 64);
 		}
