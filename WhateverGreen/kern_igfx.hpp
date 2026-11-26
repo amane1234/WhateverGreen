@@ -223,6 +223,10 @@ private:
 	 */
 	bool gPlatformListIsSNB {false};
 
+	bool guardFBCTimer {false};
+	void (*orgUpdateFBC)(void *, uint32_t) {nullptr};
+	static void wrapUpdateFBC(void *framebuffer, uint32_t event);
+
 	/**
 	 *  IGPU support
 	 */

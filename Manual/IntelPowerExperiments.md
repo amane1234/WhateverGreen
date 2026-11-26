@@ -79,3 +79,8 @@ The PWM start value is sampled by the submitter outside the request spinlock. Or
 Start with `igfxpwr=256` to observe the native framebuffer. To test the dynamic flag, use `igfxpwr=256 -igfxdynfbc`. Remove `-igfxdynfbc` and reboot to restore observation alone. An explicit framebuffer-flags override takes precedence. Combining the test with the base FBC request (bit 2) suppresses the extra dynamic flag.
 
 The opt-in adds only bit 0x10 to the selected platform entry before native framebuffer setup. It requires existing base FBC in the effective flags, a recognized sufficient DVMT budget and a port-zero LVDS/eDP layout with framebuffer memory slots and pipes. `weg-dynamic-fbc-result` on the framebuffer controller records the decision. A request confirms only the table setting. Native `weg-power-fbc-enabled` and `weg-power-fbc-compressing` observations describe FBC activity and cannot distinguish dynamic switching. These preconditions cannot validate Apple's internal allocations or exclude the earlier panic.
+
+## FBC transaction timer guard (`-igfxfbctimerguard`)
+
+For the Apple CFL framebuffer of macOS build 24H232 only (matched by the binary's UUID), `-igfxfbctimerguard` routes `AppleIntelFramebuffer::UpdateFBC`. Events 1 and 4, which can arm the FBC transaction timer, and any event while a transition is pending are skipped when the controller has no timer object; every other call goes to Apple's code. The two object offsets it reads are private to that build, so any other build logs `FBC timer guard unavailable: unrecognized framebuffer UUID` and nothing is changed. Use it together with the dynamic FBC test to check whether a missing timer causes the earlier panic.
+

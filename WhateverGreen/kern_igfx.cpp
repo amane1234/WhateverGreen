@@ -175,6 +175,7 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	if (info->videoBuiltin && !gPlatformGraphicsSupported) {
 		switchOffGraphics = switchOffFramebuffer = true;
 	} else if (info->videoBuiltin) {
+		guardFBCTimer = checkKernelArgument("-igfxfbctimerguard");
 		applyFramebufferPatch = loadPatchesFromDevice(info->videoBuiltin, info->reportedFramebufferId);
 
 #ifdef DEBUG
@@ -275,7 +276,7 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		
 		// Ideally, we could get rid of these two lambda expressions
 		auto requiresFramebufferPatches = [this]() {
-			if (applyFramebufferPatch || hdmiAutopatch || powerFlagMask)
+			if (applyFramebufferPatch || hdmiAutopatch || powerFlagMask || guardFBCTimer)
 				return true;
 			if (dumpFramebufferToDisk || dumpPlatformTable)
 				return true;
@@ -319,6 +320,45 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		KernelPatcher::RouteRequest request("__ZN9IOService20copyExistingServicesEP12OSDictionaryjj", wrapCopyExistingServices, orgCopyExistingServices);
 		patcher.routeMultiple(KernelPatcher::KernelID, &request, 1);
 	}
+}
+
+// The two object offsets below are private to the CFL driver in build 24H232.
+static bool matchesFBCTimerLayout(mach_vm_address_t address, size_t size) {
+	static constexpr uint8_t uuid[] = {
+		0x6A, 0x12, 0x9C, 0x83, 0x8F, 0xE9, 0x34, 0xFD,
+		0x92, 0x47, 0x7C, 0x48, 0x88, 0xAA, 0xEB, 0x31
+	};
+	if (!address || size < sizeof(mach_header_64))
+		return false;
+	auto *header = reinterpret_cast<const mach_header_64 *>(address);
+	if (header->magic != MH_MAGIC_64 || header->sizeofcmds > size - sizeof(*header))
+		return false;
+	auto cursor = reinterpret_cast<const uint8_t *>(header + 1);
+	size_t remaining = header->sizeofcmds;
+	for (uint32_t i = 0; i < header->ncmds && remaining >= sizeof(load_command); ++i) {
+		auto cmd = reinterpret_cast<const load_command *>(cursor);
+		if (cmd->cmdsize < sizeof(*cmd) || cmd->cmdsize > remaining)
+			return false;
+		if (cmd->cmd == LC_UUID)
+			return cmd->cmdsize == sizeof(uuid_command) &&
+				memcmp(reinterpret_cast<const uuid_command *>(cmd)->uuid, uuid, sizeof(uuid)) == 0;
+		cursor += cmd->cmdsize;
+		remaining -= cmd->cmdsize;
+	}
+	return false;
+}
+
+void IGFX::wrapUpdateFBC(void *framebuffer, uint32_t event) {
+	auto controller = getMember<void *>(framebuffer, 0x1D0);
+	if (!controller)
+		return;
+	// Events 1 and 4 can arm the transaction timer. Other events may cancel
+	// it when a transition is pending. Preserve native idle cleanup otherwise.
+	if (event == 1 || event == 4 || getMember<uint8_t>(controller, 0x1B68) == 1) {
+		if (!getMember<void *>(controller, 0x1B60))
+			return;
+	}
+	callbackIGFX->orgUpdateFBC(framebuffer, event);
 }
 
 bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -369,6 +409,20 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 	if ((currentFramebuffer && currentFramebuffer->loadIndex == index) ||
 		(currentFramebufferOpt && currentFramebufferOpt->loadIndex == index)) {
 		
+		if (guardFBCTimer && getRealFramebuffer(index) == &kextIntelCFLFb) {
+			if (matchesFBCTimerLayout(address, size)) {
+				KernelPatcher::RouteRequest route("__ZN21AppleIntelFramebuffer9UpdateFBCEj", wrapUpdateFBC, orgUpdateFBC);
+				if (patcher.routeMultiple(index, &route, 1, address, size))
+					SYSLOG("igfx", "FBC timer guard installed");
+				else {
+					SYSLOG("igfx", "FBC timer guard unavailable: failed to route UpdateFBC");
+					patcher.clearError();
+				}
+			} else {
+				SYSLOG("igfx", "FBC timer guard unavailable: unrecognized framebuffer UUID");
+			}
+		}
+
 		// Note that the order is reversed at this stage
 		// We first process shared submodules
 		// If a shared submodule fails to process the framebuffer driver,
