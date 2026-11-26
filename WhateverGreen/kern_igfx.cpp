@@ -210,10 +210,16 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 					if (WIOKit::awaitPublishing(info->videoBuiltin)) {
 						auto raw = WIOKit::readPCIConfigValue(info->videoBuiltin, WIOKit::kIOPCIConfigGraphicsControl, 0, 16);
 						auto gms = (raw >> 8) & 0xff;
-						if ((raw & 0xffff) != 0xffff && gms >= 1 && gms <= 16)
+						// Gen9 GGC GMS: 0x01-0x10 in 32 MB units, 0x20/0x30/0x40 = 1/1.5/2 GB, 0xF0-0xFE = 4-60 MB
+						if ((raw & 0xffff) == 0xffff)
+							gms = UINT32_MAX;
+						else if (gms >= 1 && gms <= 16)
 							stolenMB = gms * 32;
+						else if (gms == 0x20 || gms == 0x30 || gms == 0x40)
+							stolenMB = gms / 0x10 * 512;
 						else if (gms >= 0xf0 && gms <= 0xfe)
 							stolenMB = (gms - 0xef) * 4;
+						info->videoBuiltin->setProperty("weg-fbc-gms-raw", gms, 32);
 					}
 					powerFlagMask |= 0x4; // FBFramebufferCompression
 				}
@@ -1235,10 +1241,14 @@ void IGFX::applyPowerFlags(IOService *controller) {
 				if (match) {
 					uint32_t mask = powerFlagMask;
 					if (mask & 4) {
-						uint64_t required = static_cast<uint64_t>(match->fStolenMemorySize) * match->fFBMemoryCount + match->fFramebufferMemorySize;
-						if (!match->fFBMemoryCount || !match->fStolenMemorySize || !stolenMB || required > (static_cast<uint64_t>(stolenMB) << 20))
+						// The FAQ's TOTAL STOLEN (the DVMT a platform needs) is the per-framebuffer stolen memory, not
+						// stolen x FBMemoryCount: that product is MAX STOLEN, with every pipe active, and exceeds a
+						// typical 64 MB DVMT on most mobile entries. Add the boot framebuffer memory to stay conservative.
+						uint64_t required = static_cast<uint64_t>(match->fStolenMemorySize) + match->fFramebufferMemorySize;
+						if (!match->fStolenMemorySize || !stolenMB || required > (static_cast<uint64_t>(stolenMB) << 20))
 							mask &= ~4U;
 						controller->setProperty("weg-fbc-dvmt-mb", stolenMB, 32);
+						controller->setProperty("weg-fbc-required-mb", static_cast<uint32_t>((required + 0xfffff) >> 20), 32);
 						controller->setProperty("weg-fbc-platform-budget-ok", static_cast<uint32_t>((mask & 4) != 0), 32);
 					}
 					uint32_t flags = match->flags.value | mask;

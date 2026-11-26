@@ -195,7 +195,7 @@ The branch also adds two `igfxrpsc` modes (KBL/CFL/CML only, otherwise RPS contr
 |---|---|
 | `3` | Measures only: `weg-rps-busy-permille` is the GT busy share of the last hardware evaluation interval (1000 = 100%), `weg-rps-high-load` is `1` while the load counts as high, `weg-rps-busy-status` whether the counter could be read. Never changes the frequency. |
 | `4` | Boosts to RP0 only after three 20 ms samples in a row at 85% busy or more, and keeps the boost while the load stays above 60%. With `igfxpwr=8` an EPP of 128–255 defers the boost. |
-| `5` | Adaptive three-tier policy with AC/battery and thermal limits, adaptive sampling and a frequency residency estimate. |
+| `5` | Adaptive three-tier policy with AC/battery and core/package thermal limits, adaptive sampling, a frequency residency estimate and a 50 MHz histogram (`weg-gt-50mhz-bins-ms`). Add `-igfxvblboost` to test promoting the middle tier to RP0 near the next VBL. |
 
 An enabled explicit `framebuffer-flags` patch takes precedence over bits `2`, `4` and `256`. Bits `16`, `32` and `64` only lower what Apple's driver requests: they cannot enable PSR or a deeper DC state the driver did not ask for. Turning PSR or DC states off normally costs power; it is meant for A/B baselines and for finding the cause of flicker, wake or black-screen problems. Full details: [Manual/IntelPowerExperiments.md](./Manual/IntelPowerExperiments.md).
 
