@@ -158,6 +158,7 @@ void IGFX::init() {
 }
 
 void IGFX::deinit() {
+	OSSafeReleaseNULL(fbcGuardDevice);
 	// Deinitialize each submodule
 	for (auto submodule : submodules)
 		submodule->deinit();
@@ -176,6 +177,11 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		switchOffGraphics = switchOffFramebuffer = true;
 	} else if (info->videoBuiltin) {
 		guardFBCTimer = checkKernelArgument("-igfxfbctimerguard");
+		if (guardFBCTimer && !fbcGuardDevice) {
+			fbcGuardDevice = info->videoBuiltin;
+			fbcGuardDevice->retain();
+			fbcGuardDevice->setProperty("weg-fbc-timer-guard", "waiting for CFL framebuffer");
+		}
 		applyFramebufferPatch = loadPatchesFromDevice(info->videoBuiltin, info->reportedFramebufferId);
 
 #ifdef DEBUG
@@ -412,13 +418,16 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 		if (guardFBCTimer && getRealFramebuffer(index) == &kextIntelCFLFb) {
 			if (matchesFBCTimerLayout(address, size)) {
 				KernelPatcher::RouteRequest route("__ZN21AppleIntelFramebuffer9UpdateFBCEj", wrapUpdateFBC, orgUpdateFBC);
-				if (patcher.routeMultiple(index, &route, 1, address, size))
+				if (patcher.routeMultiple(index, &route, 1, address, size)) {
+					fbcGuardDevice->setProperty("weg-fbc-timer-guard", "installed");
 					SYSLOG("igfx", "FBC timer guard installed");
-				else {
+				} else {
+					fbcGuardDevice->setProperty("weg-fbc-timer-guard", "route failed");
 					SYSLOG("igfx", "FBC timer guard unavailable: failed to route UpdateFBC");
 					patcher.clearError();
 				}
 			} else {
+				fbcGuardDevice->setProperty("weg-fbc-timer-guard", "UUID mismatch");
 				SYSLOG("igfx", "FBC timer guard unavailable: unrecognized framebuffer UUID");
 			}
 		}
