@@ -1319,6 +1319,10 @@ private:
 		 */
 		struct Event;
 		bool rc6Fix {false};
+		bool hardwareBusy(uint64_t now);
+		uint64_t busySamplePeriod {0}, busyNext {0}, busyPublish {0}, busyUntil {0};
+		unsigned busyStreak {0};
+		uint32_t lastWindow {0}, lastBusy {0}, droppedEvents {0};
 		bool diagnostics {false};
 		uint64_t sampleTime {0}, sampleWall {0}, telemetryInterval {0}, nextTelemetry {0};
 		uint32_t sampleTicks {0};
@@ -1327,14 +1331,21 @@ private:
 		void sampleTelemetry(void *controller);
 		void publishTelemetry(const Event &event);
 		void sampleEPP();
-		enum { DisplayRegisterCount = 7 };
+		enum { DisplayRegisterCount = 8 };
 		uint32_t displayValues[DisplayRegisterCount] {};
 		uint32_t seenDisplay {0};
 		uint32_t wakeCalls[3][2] {}, wakeContexts[3] {};
 		// igfxpwr=1: when each context bit was set on each domain (0 = not held), and the hardware ACK
 		// bits last read with the GT awake. Together they show which context keeps a domain awake.
 		uint64_t wakeHoldSince[3][15] {};
-		uint32_t wakeAck[3] {};
+		uint32_t wakeAck[3] {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+		const uint64_t *lastWake {nullptr};
+		uint64_t telemetryEpoch {0}, publishedEpoch {0}, eppEpoch {0};
+		bool currentEPP() const {
+			return !lastWake || __atomic_load_n(lastWake, __ATOMIC_RELAXED) ==
+				__atomic_load_n(&eppEpoch, __ATOMIC_ACQUIRE);
+		}
+		uint32_t lastClock {UINT32_MAX};
 		bool wakeHookInstalled {false};
 		// igfxpwr=8: while the CPU's HWP EPP prefers performance, boost after one busy interval
 		uint64_t fastBoostUntil {0};
@@ -1368,7 +1379,7 @@ private:
 		void *rc6LogCall {nullptr};
 		// Only the sampler may access the snapshot. Bit 1 permanently closes admission.
 		uint32_t rc6Sampler {0};
-		struct Event { uint32_t kind, v0, v1, v2; };
+		struct Event { uint32_t kind, v0, v1, v2; uint64_t epoch; };
 		Event logQueue[8] {};
 		unsigned logHead {0}, logCount {0};
 		bool logScheduled {false};

@@ -79,6 +79,8 @@ constexpr uint32_t RC6_REGISTERS[] {
 };
 
 enum RC6Event : uint32_t {
+	RPSEventEPP = 1U << 9,
+	RPSEventBusy = 1U << 8,
 	RC6EventSnapshot  = 1U << 0,
 	RC6EventRestored  = 1U << 1,
 	RC6EventGiveUp    = 1U << 2,
@@ -181,14 +183,25 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 	if (PE_parse_boot_argn("igfxrpsc", &rpsc, sizeof(rpsc)) ||
 		WIOKit::getOSDataValue(info->videoBuiltin, "rps-control", rpsc)) {
 		enabled = rpsc > 0 && available;
-		mode = rpsc == 0 ? 0 : (rpsc >= 2 ? 2 : 1);
+		mode = min(rpsc, 2U);
+		if (rpsc == 3 || rpsc == 4) {
+			auto cpu = BaseDeviceInfo::get().cpuGeneration;
+			mode = available && (cpu == CPUInfo::CpuGeneration::KabyLake ||
+				cpu == CPUInfo::CpuGeneration::CoffeeLake || cpu == CPUInfo::CpuGeneration::CometLake) ? rpsc : 0;
+			nanoseconds_to_absolutetime(20000000ULL, &busySamplePeriod);
+		}
 		DBGLOG("weg", "RPS control patch overriden (%u) availabile %d", rpsc, available);
 	}
 
 	// The RC6 monitor runs in the same pmNotifyWrapper hook, with or without RPS control
 	rc6Fix = available && (checkKernelArgument("-igfxrc6fix") ||
 		(info->videoBuiltin && info->videoBuiltin->getProperty("enable-rc6-fix") != nullptr));
-	diagnostics = (callbackIGFX->powerOptions & (Diagnose | RespectEPP)) != 0;
+	diagnostics = (callbackIGFX->powerOptions & (Diagnose | RespectEPP | RequestFBC | RequestDynamicFBC | RequestCDCLK)) != 0;
+	if (diagnostics || mode >= 3) {
+		lastWake = reinterpret_cast<const uint64_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_gIOLastWakeAbsTime"));
+		if (!lastWake)
+			patcher.clearError();
+	}
 	if (diagnostics) {
 		nanoseconds_to_absolutetime(5000000000ULL, &telemetryInterval);
 		if (callbackIGFX->powerOptions & RespectEPP) {
@@ -230,7 +243,7 @@ void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *in
 	}
 
 	if (enabled) {
-		if ((gtFloorCap || rc6Fix || diagnostics || displayPolicy) && info->videoBuiltin && !igpu) {
+		if ((mode >= 3 || gtFloorCap || rc6Fix || diagnostics || displayPolicy) && info->videoBuiltin && !igpu) {
 			igpu = info->videoBuiltin;
 			igpu->retain();
 		}
@@ -306,7 +319,7 @@ bool IGFX::RPSControlPatch::sustainedSubmissions(uint64_t now) {
 			burstStart = now;
 		else
 			// Sustained load normally needs two busy intervals; one while the CPU prefers performance
-			boost = now - burstStart >= (now < __atomic_load_n(&fastBoostUntil, __ATOMIC_RELAXED) ? 1 : 2) * busyInterval;
+			boost = now - burstStart >= (currentEPP() && now < __atomic_load_n(&fastBoostUntil, __ATOMIC_RELAXED) ? 1 : 2) * busyInterval;
 		lastNotify = now;
 	}
 	__atomic_store_n(&samplingLoad, false, __ATOMIC_RELEASE);
@@ -314,11 +327,15 @@ bool IGFX::RPSControlPatch::sustainedSubmissions(uint64_t now) {
 }
 
 void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-	if ((rc6Fix || diagnostics) && !rc6LogCall) {
+	if ((mode >= 3 || rc6Fix || diagnostics) && !rc6LogCall) {
 		logLock = IOSimpleLockAlloc();
 		if (logLock)
 			rc6LogCall = thread_call_allocate(logRC6, this);
 		if (!rc6LogCall) {
+			if (mode >= 3) {
+				mode = 0;
+				publish("weg-rps-busy-status", "disabled: worker unavailable");
+			}
 			if (logLock) {
 				IOSimpleLockFree(logLock);
 				logLock = nullptr;
@@ -383,7 +400,7 @@ void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_
 		if (callbackIGFX->powerOptions & (LimitDC5 | DisableDC))
 			callbackIGFX->modMMIORegistersWriteSupport.replacerList.add(&dDCState);
 	}
-	if (!gtFloorCap && !rc6Fix && !diagnostics && !displayPolicy)
+	if (mode < 3 && !gtFloorCap && !rc6Fix && !diagnostics && !displayPolicy)
 		OSSafeReleaseNULL(igpu);
 }
 
@@ -440,7 +457,7 @@ void IGFX::RPSControlPatch::processGraphicsKext(KernelPatcher &patcher, size_t i
 			patcher.clearError();
 	}
 	// The RC6 monitor alone needs no RPS changes
-	if (mode == 0)
+	if (mode == 0 || mode >= 3)
 		return;
 
 	// Address of `IGHardwareCommandStreamer2::submitExecList`
@@ -470,9 +487,14 @@ int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1,
 		self.checkRC6();
 	if (self.mode == 0 || !freq || ret != 0)
 		return ret;
+	if (self.mode >= 3) {
+		const bool boost = self.hardwareBusy(mach_absolute_time());
+		if (self.mode == 3 || !boost || (self.currentEPP() && mach_absolute_time() < __atomic_load_n(&self.deferBoostUntil, __ATOMIC_RELAXED)))
+			return ret;
+	}
 	if (self.mode == 1) {
 		auto now = mach_absolute_time();
-		if (!self.sustainedSubmissions(now) || now < __atomic_load_n(&self.deferBoostUntil, __ATOMIC_RELAXED))
+		if (!self.sustainedSubmissions(now) || (self.currentEPP() && now < __atomic_load_n(&self.deferBoostUntil, __ATOMIC_RELAXED)))
 			return ret;
 	}
 
@@ -482,11 +504,66 @@ int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1,
 	return ret;
 }
 
+// Read only during native PM notifications. No timer or ForceWake request is issued.
+bool IGFX::RPSControlPatch::hardwareBusy(uint64_t now) {
+	uint32_t idle = 0;
+	if (!__atomic_compare_exchange_n(&rc6Sampler, &idle, 1U, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+		return false;
+	if (lastWake && busyNext && busyNext - busySamplePeriod < __atomic_load_n(lastWake, __ATOMIC_RELAXED)) {
+		busyNext = busyUntil = busyPublish = 0;
+		busyStreak = lastWindow = lastBusy = 0;
+	}
+	if (now >= busyNext) {
+		const bool stale = !busyNext || now - busyNext > 3 * busySamplePeriod;
+		auto controller = callbackIGFX->defaultController();
+		uint32_t load = UINT32_MAX;
+		if (controller && callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32) {
+			auto read = [&](uint32_t reg) { return callbackIGFX->readRegister32(controller, reg); };
+			auto ack = read(FORCEWAKE_ACK_BLITTER_GEN9); // Gen9 GT domain
+			auto ctl = ack != UINT32_MAX && (ack & 0xffff) ? read(0xa024) : UINT32_MAX;
+			if (ctl != UINT32_MAX && (ctl & 0xb8) == 0x90) { // RP enabled, UP_BUSY_AVG
+				auto begin = read(0xa050);
+				auto busy = read(0xa054);
+				auto end = read(0xa050);
+				if (end <= 0xffffff && begin >= 128 && end >= begin && busy <= end &&
+					end - begin <= 1 + begin / 50 && read(FORCEWAKE_ACK_BLITTER_GEN9) == ack &&
+					(begin != lastWindow || busy != lastBusy))
+					load = static_cast<uint32_t>(1000ULL * busy / end);
+				lastWindow = begin;
+				lastBusy = busy;
+			}
+		}
+		if (stale || load == UINT32_MAX || load < 600) {
+			busyStreak = 0;
+			busyUntil = 0;
+		}
+		if (load != UINT32_MAX && load >= 850) {
+			if (busyStreak < 3)
+				++busyStreak;
+		} else if (!busyUntil || now >= busyUntil) {
+			busyStreak = 0;
+		}
+		if (load != UINT32_MAX && busyStreak == 3)
+			busyUntil = now + 3 * busySamplePeriod;
+		busyNext = now + busySamplePeriod;
+		if (now >= busyPublish) {
+			postRC6Event(RPSEventBusy, load, now < busyUntil, mode);
+			busyPublish = now + 50 * busySamplePeriod;
+		}
+	}
+	const bool boost = now < busyUntil;
+	__atomic_fetch_and(&rc6Sampler, ~1U, __ATOMIC_RELEASE);
+	return boost;
+}
+
 void IGFX::RPSControlPatch::postRC6Event(uint32_t event, uint32_t v0, uint32_t v1, uint32_t v2) {
 	auto irq = IOSimpleLockLockDisableInterrupt(logLock);
 	if (logCount < arrsize(logQueue)) {
-		logQueue[(logHead + logCount) % arrsize(logQueue)] = {event, v0, v1, v2};
+		logQueue[(logHead + logCount) % arrsize(logQueue)] = {event, v0, v1, v2,
+			lastWake ? __atomic_load_n(lastWake, __ATOMIC_RELAXED) : 0};
 		++logCount;
+	} else {
+		__atomic_fetch_add(&droppedEvents, 1U, __ATOMIC_RELAXED);
 	}
 	bool schedule = !logScheduled;
 	logScheduled = true;
@@ -508,11 +585,26 @@ void IGFX::RPSControlPatch::logRC6(void *param0, void *) {
 		self.logHead = (self.logHead + 1) % arrsize(self.logQueue);
 		--self.logCount;
 		IOSimpleLockUnlockEnableInterrupt(self.logLock, irq);
-		self.reportEvent(event);
+		if (!self.lastWake || event.epoch == __atomic_load_n(self.lastWake, __ATOMIC_RELAXED))
+			self.reportEvent(event);
 	}
 }
 
 void IGFX::RPSControlPatch::reportEvent(const Event &event) {
+	publish("weg-power-events-dropped", __atomic_load_n(&droppedEvents, __ATOMIC_RELAXED));
+	if (event.kind == RPSEventBusy) {
+		if (event.v0 == UINT32_MAX)
+			igpu->removeProperty("weg-rps-busy-permille");
+		else
+			publish("weg-rps-busy-permille", event.v0);
+		publish("weg-rps-busy-status", event.v0 == UINT32_MAX ? "counter unavailable" : "sampled");
+		publish("weg-rps-high-load", event.v1);
+		return;
+	}
+	if (event.kind == RPSEventEPP) {
+		sampleEPP();
+		return;
+	}
 	const auto events = event.kind;
 	const auto v0 = event.v0, v1 = event.v1, v2 = event.v2;
 	if (events == RC6EventTelemetry) {
@@ -562,21 +654,20 @@ void IGFX::RPSControlPatch::checkRC6() {
 }
 
 void IGFX::RPSControlPatch::sampleTelemetry(void *controller) {
-	// Like the RC6 monitor, read the GT residency counter only while the render well is awake. Asleep it
-	// reads as 0: two such reads in a row would publish a valid-looking 0 permille while the GT was in RC6,
-	// and one would replace the baseline. Skip the sample and keep the previous baseline instead.
 	const uint32_t ack = callbackIGFX->readRegister32(controller, FORCEWAKE_ACK_RENDER_GEN9);
-	if (ack == UINT32_MAX || !(ack & 0xFFFF))
-		return;
+	// ACK is a separate snapshot. Gen9 mainstream RC6 residency is an uncore register.
 	// Hardware view of the force-wake context bits, to compare with the requests the hook saw
-	__atomic_store_n(&wakeAck[0], ack & 0xFFFF, __ATOMIC_RELAXED);
+	__atomic_store_n(&wakeAck[0], ack == UINT32_MAX ? UINT32_MAX : ack & 0xFFFF, __ATOMIC_RELAXED);
 	const unsigned others[] = {DOM_MEDIA, DOM_BLITTER};
 	for (unsigned i = 0; i < arrsize(others); ++i) {
 		const uint32_t value = callbackIGFX->readRegister32(controller, ackForDom(others[i]));
-		if (value != UINT32_MAX)
-			__atomic_store_n(&wakeAck[i + 1], value & 0xFFFF, __ATOMIC_RELAXED);
+		__atomic_store_n(&wakeAck[i + 1], value == UINT32_MAX ? UINT32_MAX : value & 0xFFFF, __ATOMIC_RELAXED);
 	}
 	uint32_t ticks = callbackIGFX->readRegister32(controller, GEN6_GT_GFX_RC6);
+	// 0x138108 lies outside the Gen9 GT ForceWake ranges. Sample it independently
+	// of the advisory ACK snapshot and reject ambiguous zero / all-ones baselines.
+	if (!ticks)
+		ticks = UINT32_MAX;
 	const uint64_t now = mach_absolute_time();
 	uint64_t uptime = 0, elapsed = 0;
 	absolutetime_to_nanoseconds(now, &uptime);
@@ -615,7 +706,9 @@ void IGFX::RPSControlPatch::countWake(bool set, uint32_t domains, uint32_t conte
 			if (set) {
 				__atomic_fetch_or(&wakeContexts[i], 1U << context, __ATOMIC_RELAXED);
 				// Start of a hold: a repeated set keeps the original start time
-				uint64_t idle = 0;
+				uint64_t idle = __atomic_load_n(&wakeHoldSince[i][context], __ATOMIC_RELAXED);
+				if (idle && (!lastWake || idle >= __atomic_load_n(lastWake, __ATOMIC_RELAXED)))
+					continue;
 				__atomic_compare_exchange_n(&wakeHoldSince[i][context], &idle, mach_absolute_time(), false,
 											__ATOMIC_RELAXED, __ATOMIC_RELAXED);
 			} else {
@@ -670,7 +763,7 @@ constexpr DisplayObservation displayRegisters[] = {
 	{0x6F840, "weg-power-psr1-status-raw"}, {0x6F940, "weg-power-psr2-status-raw"},
 	{0x45504, "weg-power-dc-policy-raw"}, {0x80030, "weg-power-dc3-dc5-count"},
 	{0x8002C, "weg-power-dc5-dc6-count"}, {0x43208, "weg-power-fbc-control-raw"},
-	{0x46000, "weg-power-cdclk-control-raw"}
+	{0x46000, "weg-power-cdclk-control-raw"}, {0x43214, "weg-power-fbc-status2-raw"}
 };
 }
 
@@ -690,20 +783,24 @@ void IGFX::RPSControlPatch::observeDisplayRead(uint32_t address, uint32_t value)
 void IGFX::RPSControlPatch::sampleEPP() {
 	uint32_t epp = UINT32_MAX, lo = 0, hi = 0;
 	// Sample the worker CPU. Respect package delegation when its local EPP is not valid.
+	auto irq = IOSimpleLockLockDisableInterrupt(logLock);
+	auto epoch = lastWake ? __atomic_load_n(lastWake, __ATOMIC_RELAXED) : 0;
 	if (readMsr && !readMsr(0x770, &lo, &hi) && (lo & 1) &&
 		!readMsr(0x774, &lo, &hi)) {
 		if (!(hi & (1U << 10)) || (hi & (1U << 28)) || !readMsr(0x772, &lo, &hi))
 			epp = lo >> 24;
 	}
+	IOSimpleLockUnlockEnableInterrupt(logLock, irq);
 	// Both directions follow the CPU's own preference: EPP 128-255 (power saving) defers the extra RP0
 	// boost, EPP 0-63 (performance) boosts after one busy interval instead of two, 64-127 keeps the default.
 	// Each hint lasts two sampling intervals and expires on a read failure. No MSR is written.
-	const bool known = mode == 1 && epp != UINT32_MAX;
+	const bool known = (mode == 1 || mode == 4) && epp != UINT32_MAX;
 	const bool defer = known && epp >= 128;
-	const bool fast = known && epp <= 63;
+	const bool fast = mode == 1 && known && epp <= 63;
 	const uint64_t until = mach_absolute_time() + 2 * telemetryInterval;
 	__atomic_store_n(&deferBoostUntil, defer ? until : 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&fastBoostUntil, fast ? until : 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&eppEpoch, epoch, __ATOMIC_RELEASE);
 	if (epp == UINT32_MAX)
 		igpu->removeProperty("weg-power-hwp-epp");
 	else
@@ -723,10 +820,32 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 	publish("weg-power-window-ms", event.v1);
 	publish("weg-power-uptime-s", event.v2);
 	publish("weg-power-status", event.v0 == UINT32_MAX ? "waiting for a valid window" : "sampled");
+	auto wake = lastWake ? __atomic_load_n(lastWake, __ATOMIC_RELAXED) : 0;
+	if (wake != publishedEpoch) {
+		publishedEpoch = wake;
+		lastClock = UINT32_MAX;
+		for (const auto &reg : displayRegisters)
+			igpu->removeProperty(reg.property);
+		igpu->removeProperty("weg-power-fbc-enabled");
+		igpu->removeProperty("weg-power-fbc-compressing");
+		igpu->removeProperty("weg-power-cdclk-transition-observed");
+	}
 	const uint32_t seen = __atomic_exchange_n(&seenDisplay, 0U, __ATOMIC_ACQUIRE);
 	for (unsigned i = 0; i < arrsize(displayRegisters); ++i)
-		if (seen & (1U << i))
-			publish(displayRegisters[i].property, __atomic_load_n(&displayValues[i], __ATOMIC_RELAXED));
+		if (seen & (1U << i)) {
+			auto value = __atomic_load_n(&displayValues[i], __ATOMIC_RELAXED);
+			publish(displayRegisters[i].property, value);
+			if (displayRegisters[i].address == 0x43208)
+				publish("weg-power-fbc-enabled", value >> 31);
+			if (displayRegisters[i].address == 0x43214)
+				publish("weg-power-fbc-compressing", static_cast<uint32_t>((value & 0xfff) != 0));
+			if (displayRegisters[i].address == 0x46000) {
+				auto clock = value & 0x7ff;
+				if (lastClock != UINT32_MAX && lastClock != clock)
+					publish("weg-power-cdclk-transition-observed", 1U);
+				lastClock = clock;
+			}
+		}
 
 	const bool hooked = __atomic_load_n(&wakeHookInstalled, __ATOMIC_ACQUIRE);
 	publish("weg-power-forcewake-hook", static_cast<uint32_t>(hooked));
@@ -743,14 +862,18 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 			snprintf(key, sizeof(key), "weg-power-fw-%s-contexts", domains[i]);
 			publish(key, __atomic_load_n(&wakeContexts[i], __ATOMIC_RELAXED));
 			snprintf(key, sizeof(key), "weg-power-fw-%s-ack", domains[i]);
-			publish(key, __atomic_load_n(&wakeAck[i], __ATOMIC_RELAXED));
+			auto ack = __atomic_load_n(&wakeAck[i], __ATOMIC_RELAXED);
+			if (ack == UINT32_MAX)
+				igpu->removeProperty(key);
+			else
+				publish(key, ack);
 
 			// Longest current hold among the context bits of this domain
 			uint64_t oldest = 0;
 			uint32_t holder = 0;
 			for (uint32_t c = 0; c < arrsize(wakeHoldSince[i]); ++c) {
 				const uint64_t since = __atomic_load_n(&wakeHoldSince[i][c], __ATOMIC_RELAXED);
-				if (since && (!oldest || since < oldest)) {
+				if (since && since >= wake && ack != UINT32_MAX && (ack & (1U << c)) && (!oldest || since < oldest)) {
 					oldest = since;
 					holder = c;
 				}
@@ -777,18 +900,27 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 		publish("weg-power-psr2-writes-cleared", __atomic_load_n(&filteredWrites[1], __ATOMIC_RELAXED));
 		publish("weg-power-dc-writes-limited", __atomic_load_n(&filteredWrites[2], __ATOMIC_RELAXED));
 	}
-	if (callbackIGFX->powerOptions & RespectEPP)
-		sampleEPP();
 }
 
 void IGFX::RPSControlPatch::sampleRC6(uint64_t now) {
 	auto controller = callbackIGFX->defaultController();
-	if (!controller || !callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32)
-		return;
 	if (diagnostics && now >= nextTelemetry) {
 		nextTelemetry = now + telemetryInterval;
-		sampleTelemetry(controller);
+		auto epoch = lastWake ? __atomic_load_n(lastWake, __ATOMIC_RELAXED) : 0;
+		if (epoch != telemetryEpoch) {
+			telemetryEpoch = epoch;
+			sampleTime = sampleWall = 0;
+			__atomic_store_n(&seenDisplay, 0U, __ATOMIC_RELEASE);
+			__atomic_store_n(&deferBoostUntil, 0ULL, __ATOMIC_RELAXED);
+			__atomic_store_n(&fastBoostUntil, 0ULL, __ATOMIC_RELAXED);
+		}
+		if (callbackIGFX->powerOptions & RespectEPP)
+			postRC6Event(RPSEventEPP, 0);
+		if (controller && callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32)
+			sampleTelemetry(controller);
 	}
+	if (!controller || !callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32)
+		return;
 	if (!rc6Fix || !callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32)
 		return;
 
@@ -838,7 +970,7 @@ void IGFX::RPSControlPatch::sampleRC6(uint64_t now) {
 		// Residency should advance between submissions on an idle desktop. When it does not, something
 		// (usually a held forcewake reference) keeps the GT awake: report it, it is not safe to fix here.
 		uint32_t residency = callbackIGFX->readRegister32(controller, GEN6_GT_GFX_RC6);
-		if (residency == UINT32_MAX)
+		if (!residency || residency == UINT32_MAX || callbackIGFX->readRegister32(controller, FORCEWAKE_ACK_RENDER_GEN9) != ackRender)
 			return;
 		if (residency != rc6LastResidency) {
 			rc6LastResidency = residency;
