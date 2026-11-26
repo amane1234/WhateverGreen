@@ -1328,19 +1328,7 @@ private:
 		uint32_t lastDownWindow {0}, lastIdle {0};
 		bool packageSensor {false}, deadlineBoost {false};
 		uint64_t vblAnchor {0}, vblPeriod {0};
-		uint32_t vblSequence {0}, deadlineRequests {0};
-		// igfxrpsc=5 decisions with a nonzero measured tier: request raised to the middle tier or RP0,
-		// Apple's request already as high, and tier lowered by the AC/thermal ceiling
-		uint32_t boostRaised[2] {}, boostNative {0}, boostCapped {0};
-		uint64_t freqAt {0}, freqBins[32] {};
-		unsigned freqBin {32};
-		uint32_t measuredMHz {0};
-		uint32_t dcPrevious[2] {}, dcEpoch[2] {};
-		uint64_t dcTime[2] {};
-		uint32_t dcRate[2] {UINT32_MAX, UINT32_MAX};
-		bool dcSampling[2] {};
-		void recordDC(unsigned slot, uint32_t value);
-		void recordClock(uint32_t ratio, uint64_t now);
+		uint32_t vblSequence {0};
 		bool nearVBL(uint64_t now);
 		uint32_t acGeneration {0}, acConsumed {0}, policyGeneration {0};
 		IONotifier *acNotifier {nullptr};
@@ -1353,25 +1341,15 @@ private:
 		uint32_t policyLimit {0}, measuredTier {0};
 		uint64_t policyAt {0}, previousBusySample {0};
 		int (*thermalMsr)(uint32_t, uint32_t *, uint32_t *) {nullptr};
-		struct Residency {
-			uint64_t last {0}, ns[3] {};
-			unsigned previous {3};
-			bool writing {false};
-			void record(unsigned state, uint64_t now, uint64_t wake);
-		};
-		Residency freqProfile, psrProfile[2];
 		uint64_t busySamplePeriod {0}, busyNext {0}, busyPublish {0}, busyUntil {0};
 		unsigned busyStreak {0};
-		uint32_t lastWindow {0}, lastBusy {0}, droppedEvents {0};
-		// igfxrpsc=3/4 diagnostics: raw reads of the last sample (GT ACK, RP_CONTROL, up EI, up busy, up EI
-		// again; UINT32_MAX when not read) and per-result sample counts (see BusyResult in kern_igfx_pm.cpp)
-		enum { BusyRawCount = 6 };
-		uint32_t busyRaw[BusyRawCount] {};
-		uint32_t busyResults[9] {};
+		uint32_t lastWindow {0}, lastBusy {0};
 		// RC6 residency (uncore, readable without ForceWake) at the previous load sample
 		uint32_t busyRc6 {0};
 		uint64_t busyRc6At {0};
-		bool diagnostics {false};
+		// diagnostics: the 5 s telemetry tick runs (igfxpwr=1, 8 or 256). observe: RC6 residency and display
+		// register observations are published (igfxpwr=1 or 256). Bits 2 and 4 alone publish nothing at runtime.
+		bool diagnostics {false}, observe {false};
 		uint64_t sampleTime {0}, sampleWall {0}, telemetryInterval {0}, nextTelemetry {0};
 		uint32_t sampleTicks {0};
 		uint64_t deferBoostUntil {0};
@@ -1382,11 +1360,6 @@ private:
 		enum { DisplayRegisterCount = 8 };
 		uint32_t displayValues[DisplayRegisterCount] {};
 		uint32_t seenDisplay {0};
-		uint32_t wakeCalls[3][2] {}, wakeContexts[3] {};
-		// igfxpwr=1: when each context bit was set on each domain (0 = not held), and the hardware ACK
-		// bits last read with the GT awake. Together they show which context keeps a domain awake.
-		uint64_t wakeHoldSince[3][15] {};
-		uint32_t wakeAck[3] {UINT32_MAX, UINT32_MAX, UINT32_MAX};
 		const uint64_t *lastWake {nullptr};
 		uint64_t telemetryEpoch {0}, publishedEpoch {0}, eppEpoch {0};
 		bool currentEPP() const {
@@ -1394,7 +1367,6 @@ private:
 				__atomic_load_n(&eppEpoch, __ATOMIC_ACQUIRE);
 		}
 		uint32_t lastClock {UINT32_MAX};
-		bool wakeHookInstalled {false};
 		// igfxpwr=8: while the CPU's HWP EPP prefers performance, boost after one busy interval
 		uint64_t fastBoostUntil {0};
 		// igfxpwr=16/32/64: filters on the Apple framebuffer's PSR and DC state writes
@@ -1403,14 +1375,11 @@ private:
 		static constexpr uint32_t DCStateEnable = 0x45504; // DC_STATE_EN, bits 1:0 = 1 up to DC5, 2 up to DC6
 		bool displayPolicy {false};
 		bool displayPolicyRegistered {false};
-		uint32_t filteredWrites[3] {};                     // PSR1, PSR2, DC state
 		static void filterPSR(void *controller, uint32_t address, uint32_t value);
 		static void filterDCState(void *controller, uint32_t address, uint32_t value);
 		MMIOWriteInjectionDescriptor dPSR1 {PSR1Control, filterPSR};
 		MMIOWriteInjectionDescriptor dPSR2 {PSR2Control, filterPSR};
 		MMIOWriteInjectionDescriptor dDCState {DCStateEnable, filterDCState};
-		void (*orgObservedWake)(void *, bool, uint32_t, uint32_t) {nullptr};
-		static void observeWake(void *, bool, uint32_t, uint32_t);
 		enum class Recovery { learning, armed, verifying, suspended };
 		Recovery recovery {Recovery::learning};
 		uint64_t restoreEpoch {0};
@@ -1470,9 +1439,7 @@ private:
 		 */
 		bool available {false};
 		void observeDisplayRead(uint32_t address, uint32_t value);
-		void countWake(bool set, uint32_t domains, uint32_t context);
 		void observedReset() { __atomic_fetch_add(&resetGeneration, 1U, __ATOMIC_ACQ_REL); }
-		void wakeHookReady() { __atomic_store_n(&wakeHookInstalled, true, __ATOMIC_RELEASE); }
 		~RPSControlPatch() override { deinit(); }
 		
 		// MARK: Patch Submodule IMP

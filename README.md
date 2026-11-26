@@ -123,7 +123,7 @@ Read [FAQs](./Manual/) and avoid asking any questions. No support is provided fo
 | `igfxrpsc=1` 		 	| `rps-control` property on IGPU 	| Enable RPS control patch (improves IGPU performance). `1` boosts to the maximum frequency only under sustained load, `2` always requests the maximum frequency (old behaviour, can keep the GPU at maximum clock after S3/S4 sleep). **Experimental branch only**, KBL/CFL/CML: `3` measures GT load from the hardware RP busy counters without boosting (`weg-rps-busy-permille`), `4` boosts only while that measured load stays high, `5` three-tier boost limited by AC/battery and CPU temperature 	|
 | `igfxgtfloor=MHz` 		| `gt-floor-freq` property on IGPU 	| With Apple GuC (`igfxfw=2`), cap the GPU minimum frequency that AGPM requests (e.g. 500 MHz) at the given value. Values at or below the hardware minimum give the hardware minimum (e.g. `igfxgtfloor=300`). KBL and CFL framebuffers only 	|
 | `-igfxrc6fix` 		 	| `enable-rc6-fix` property on IGPU 	| Restore the RC6 (GPU idle power state) configuration when it is lost, e.g. after S3/S4 sleep, and log RC6 problems (`igfx_pm` in the kernel log). SKL/KBL/CFL/CML only 	|
-| `igfxpwr=MASK` 		 	| N/A 	| **Experimental.** Power diagnostics and display power policy requests for a display-connected KBL/CFL/CML iGPU, off by default. Bits: `1` observe (RC6 residency, ForceWake requests and holds, display registers the framebuffer already reads, published as `weg-power-*` IGPU properties), `2` request native FBC, `256` observe native dynamic FBC, `4` request native dynamic CDCLK (`2`, `4` and `256` also turn on observation), `8` HWP-EPP-aware `igfxrpsc=1` boost in both directions (includes observation), `16` PSR off, `32` DC states limited to DC5, `64` DC5/DC6 off, `128` native modeset (no forced complete modeset). Try one policy change per boot. [Read the manual](./Manual/IntelPowerExperiments.md) 	|
+| `igfxpwr=MASK` 		 	| N/A 	| **Experimental.** Power diagnostics and display power policy requests for a display-connected KBL/CFL/CML iGPU, off by default. Bits: `1` observe for testing (RC6 residency and display registers the framebuffer already reads, published as `weg-power-*` IGPU properties), `2` request native FBC, `256` observe native dynamic FBC, `4` request native dynamic CDCLK, `8` HWP-EPP-aware boost for `igfxrpsc=1`, `4` and `5`, `16` PSR off, `32` DC states limited to DC5, `64` DC5/DC6 off, `128` native modeset (no forced complete modeset). Try one policy change per boot. [Read the manual](./Manual/IntelPowerExperiments.md) 	|
 | `igfxsnb=0` 		  | N/A 	| Disable IntelAccelerator name fix for Sandy Bridge CPUs 	|
 
 ##### Backlight
@@ -169,35 +169,43 @@ Read [FAQs](./Manual/) and avoid asking any questions. No support is provided fo
 
 #### Experimental branch
 
-This `experimental` branch is `master` plus an **experimental** Intel graphics power option. **Default: off.** Without `igfxpwr` in `boot-args` (or with `igfxpwr=0`) none of the features below run, and the kext behaves exactly like `master`; each bit has to be added explicitly. There is no DeviceProperties equivalent, so nothing can turn them on by accident. Removing the boot argument restores the `master` behaviour. Keep a bootable copy of your current EFI while testing.
+This `experimental` branch is `master` plus **experimental** Intel graphics power options. **Default: off.** Without `igfxpwr` or the new `igfxrpsc` values in `boot-args` none of the features below run, and the kext behaves exactly like `master`. There is no DeviceProperties equivalent for `igfxpwr`, so nothing can turn it on by accident. Keep a bootable copy of your current EFI while testing.
 
 ##### What is added
 
-`igfxpwr=MASK` for a display-connected Kaby Lake, Coffee Lake or Comet Lake iGPU on the Apple KBL/CFL framebuffer. `MASK` is the sum of these bits:
+For a display-connected Kaby Lake, Coffee Lake or Comet Lake iGPU on the Apple KBL/CFL framebuffer. `igfxpwr=MASK` is the sum of these bits:
 
 | Bit | Value | Effect |
 |---|---|---|
-| Observe | `1` | Publishes GT RC6 residency, observed ForceWake set/clear calls with per-context hold times and the hardware ACK, and the last PSR, DC state, FBC and CDCLK registers the Apple framebuffer read, as `weg-power-*` properties on IGPU. Samples ride on GPU notifications at most every 5 s; no new timer. Changes nothing. |
-| FBC | `2` | Asks the Apple framebuffer for native FBC (adds `FBFramebufferCompression`, 0x4, to the selected platform entry). Turns on observation, so `weg-power-fbc-enabled` and `weg-power-fbc-compressing` show whether FBC is on and compressing. |
-| CDCLK | `4` | Asks for native dynamic CDCLK. Also needs Apple's `SupportDynamicCDClk=1` and `dc6config=3`. Turns on observation; `weg-power-cdclk-transition-observed` is `1` once the CDCLK frequency field was seen to change. |
-| EPP | `8` | With `igfxrpsc=1` (or `igfxrpsc=4`, defer only), follows the CPU's HWP EPP in both directions: power saving (128–255) defers WhateverGreen's extra RP0 boost, performance (0–63) boosts after one busy interval instead of two. Reads MSRs only, never writes them. Includes Observe. |
+| Observe | `1` | Testing only. Publishes GT RC6 residency and the last PSR, DC state, FBC and CDCLK registers the Apple framebuffer read, as `weg-power-*` properties on IGPU. Samples ride on GPU notifications at most every 5 s; no new timer. Changes nothing. |
+| FBC | `2` | Asks the Apple framebuffer for native FBC (adds `FBFramebufferCompression`, 0x4, to the selected platform entry), after checking the DVMT against the entry's stolen memory (`weg-fbc-platform-budget-ok`). |
+| CDCLK | `4` | Asks for native dynamic CDCLK. Also needs Apple's `SupportDynamicCDClk=1` and `dc6config=3`. |
+| EPP | `8` | With `igfxrpsc=1`, `4` or `5`, follows the CPU's HWP EPP: power saving (128–255) defers WhateverGreen's extra RP0 boost, performance (0–63) lets `igfxrpsc=1` boost after one busy interval instead of two. Reads MSRs only, never writes them. |
 | PSR off | `16` | Clears the enable bit from the framebuffer's PSR1/PSR2 control writes, so PSR is never entered. |
 | DC5 limit | `32` | Writes a DC6 request as DC5. |
 | DC off | `64` | Clears DC5/DC6 from DC state writes (overrides `32`). |
-| Dynamic FBC | `256` | Observes native policy. The forced dynamic FBC path is suspended pending panic diagnosis. |
 | Native modeset | `128` | Turns off WhateverGreen's forced complete modeset so the Apple driver decides when one is needed, like `igfxfcms=0` (an explicit `igfxfcms` or `complete-modeset` wins). |
+| Dynamic FBC | `256` | Testing only. Observes with dynamic FBC left under native policy. The forced dynamic FBC path is suspended pending panic diagnosis. |
 
-Observation values are reset at each wake from sleep, so samples, ForceWake holds and EPP hints from before sleep are never mixed with new ones.
-
-The branch also adds two `igfxrpsc` modes (KBL/CFL/CML only, otherwise RPS control stays off). They read the GT's own RP busy counters during Apple's PM notifications only; no timer and no ForceWake request is added:
+The branch also adds three `igfxrpsc` modes (KBL/CFL/CML only, otherwise RPS control stays off). They read the GT's own RP busy counters during Apple's PM notifications only; no timer and no ForceWake request is added:
 
 | `igfxrpsc` | Effect |
 |---|---|
-| `3` | Measures only: `weg-rps-busy-permille` is the GT busy share of the last hardware evaluation interval (1000 = 100%), `weg-rps-high-load` is `1` while the load counts as high, `weg-rps-busy-status` whether the counter could be read. Never changes the frequency. |
-| `4` | Boosts to RP0 only after three 20 ms samples in a row at 85% busy or more, and keeps the boost while the load stays above 60%. With `igfxpwr=8` an EPP of 128–255 defers the boost. |
-| `5` | Adaptive three-tier policy with AC/battery and core/package thermal limits, adaptive sampling, a frequency residency estimate and a 50 MHz histogram (`weg-gt-50mhz-bins-ms`). Add `-igfxvblboost` to test promoting the middle tier to RP0 near the next VBL. |
+| `3` | Testing only: measures the GT busy share (`weg-rps-busy-permille`, 1000 = 100%), `weg-rps-high-load` and `weg-rps-busy-status`. Never changes the frequency. |
+| `4` | Boosts to RP0 only after three 20 ms samples in a row at 85% busy or more, and keeps the boost while the load stays above 60%. |
+| `5` | Three tiers: Apple's request below 60% busy, up to the midpoint between the minimum and maximum frequency at 60% or more, RP0 after three samples at 85% or more. Battery or a small CPU thermal margin limits it to the midpoint; it only ever raises Apple's request. Add `-igfxvblboost` to also promote the middle tier to RP0 near the next VBL. |
 
-An enabled explicit `framebuffer-flags` patch takes precedence over bits `2`, `4` and `256`. Bits `16`, `32` and `64` only lower what Apple's driver requests: they cannot enable PSR or a deeper DC state the driver did not ask for. Turning PSR or DC states off normally costs power; it is meant for A/B baselines and for finding the cause of flicker, wake or black-screen problems. Full details: [Manual/IntelPowerExperiments.md](./Manual/IntelPowerExperiments.md).
+An enabled explicit `framebuffer-flags` patch takes precedence over bits `2` and `4`. Bits `16`, `32` and `64` only lower what Apple's driver requests: they cannot enable PSR or a deeper DC state the driver did not ask for. Turning PSR or DC states off normally costs power; it is meant for A/B baselines and for finding the cause of flicker, wake or black-screen problems. Full details: [Manual/IntelPowerExperiments.md](./Manual/IntelPowerExperiments.md).
+
+##### Daily use
+
+The options that change behaviour publish nothing at runtime, only a few properties set once at boot. Leave the testing options out: for example `igfxpwr=2 igfxrpsc=5` (FBC and the three-tier boost) instead of `igfxpwr=3 igfxrpsc=5`. Check once that it is applied:
+
+```sh
+ioreg -lw0 -p IOService | grep -E '"weg-(power-framebuffer|fbc|rps-control-mode)'
+```
+
+`weg-power-framebuffer-matched` should be `1`, `weg-power-framebuffer-flags` should contain 0x4, and `weg-fbc-platform-budget-ok` should be `1`.
 
 ##### How to test it
 
@@ -211,15 +219,12 @@ An enabled explicit `framebuffer-flags` patch takes precedence over bits `2`, `4
 
    `weg-power-rc6-permille` is the share of the last window spent in GT RC6 (900 = 90%), `weg-power-window-ms` the window length and `weg-power-status` whether the window was valid. A fully idle GPU may leave an old sample visible.
 4. Then test **one** policy change per boot, comparing with the `igfxpwr=1` readings:
-   - `igfxpwr=3`: FBC only (check that `weg-power-framebuffer-matched` is `1` and `weg-power-framebuffer-flags` has 0x4)
-   - Use `igfxpwr=3` to test ordinary FBC. Bit 256 leaves dynamic FBC under native driver control.
+   - `igfxpwr=3`: FBC (check that `weg-power-framebuffer-matched` is `1` and `weg-power-framebuffer-flags` has 0x4)
    - `igfxpwr=5`: dynamic CDCLK
    - `igfxpwr=9 igfxrpsc=1`: EPP-aware boost (`weg-power-hwp-epp`, `weg-power-defer-rp0`, `weg-power-boost-bias`)
-   - `igfxpwr=1 igfxrpsc=3`: GT load measurement only (`ioreg -lw0 -p IOService | grep '"weg-rps-'`); then `igfxrpsc=4` to boost on measured load and compare with `igfxrpsc=1`. `igfxrpsc=4` and `5` can only boost once `weg-rps-busy-status` shows `sampled`
-   - `igfxrpsc=5`: tiered boost (`weg-rps-policy-tier-limit`, `weg-rps-power-source`, `weg-rps-core-thermal-margin-c`, `weg-gt-*-ms`)
-   - `igfxpwr=17`: PSR off (`weg-power-psr1-writes-cleared`, `weg-power-psr2-writes-cleared` count the changed writes)
-   - `igfxpwr=33` or `igfxpwr=65`: DC states limited to DC5, or off (`weg-power-dc-writes-limited`, `weg-power-dc3-dc5-count`, `weg-power-dc5-dc6-count`)
+   - `igfxrpsc=3`: GT load measurement only (`ioreg -lw0 -p IOService | grep '"weg-rps-'`); then `igfxrpsc=4` or `5` to boost on measured load and compare with no `igfxrpsc`
+   - `igfxpwr=17`: PSR off
+   - `igfxpwr=33` or `igfxpwr=65`: DC states limited to DC5, or off (`weg-power-dc3-dc5-count`, `weg-power-dc5-dc6-count` when Apple reads them)
    - `igfxpwr=129`: native modeset (`weg-power-native-modeset` is `1`)
-   - ForceWake leaks need no extra bit: with `igfxpwr=1`, check `weg-power-fw-leak-suspect` and `weg-power-fw-<render|media|blitter>-longest-hold-ms`
 5. For each setting, keep brightness, panel mode, AC/battery state and workload the same, and compare several equal idle and video intervals. After changing display flags, also check wake from S3/S4, lid open/close and external display reconnect. Use an independent power measurement (for example `powermetrics` or battery drain) for watts or battery life.
 6. To go back, remove `igfxpwr` (and the extra `igfxrpsc`) from `boot-args` and reboot.

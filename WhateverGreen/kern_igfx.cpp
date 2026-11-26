@@ -535,7 +535,7 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 	switch (address) {
 		case 0x6F840: case 0x6F940: case 0x45504: case 0x80030:
 		case 0x8002C: case 0x43208: case 0x43214: case 0x46000:
-			if (callbackIGFX->powerOptions & (Diagnose | RespectEPP | RequestFBC | RequestDynamicFBC | RequestCDCLK))
+			if (callbackIGFX->powerOptions & (Diagnose | RequestDynamicFBC))
 				callbackIGFX->modRPSControlPatch.observeDisplayRead(address, retVal);
 			break;
 	}
