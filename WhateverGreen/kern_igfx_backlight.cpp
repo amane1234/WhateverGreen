@@ -1519,6 +1519,12 @@ bool IGFX::BacklightSmoother::writeIfCurrent(const BrightnessRequest &active, ui
 void IGFX::BacklightSmoother::submitRequest(void *controller, uint32_t address, uint32_t value, uint32_t mask) {
 	auto &smoother = callbackIGFX->modBacklightSmoother;
 	auto irq = IOSimpleLockLockDisableInterrupt(smoother.requestLock);
+	// Coalesce identical pending nonzero requests without restarting the fade.
+	if ((value & mask) && smoother.request.controller == controller && smoother.request.address == address &&
+		smoother.request.mask == mask && smoother.request.target == value) {
+		IOSimpleLockUnlockEnableInterrupt(smoother.requestLock, irq);
+		return;
+	}
 	smoother.request = BrightnessRequest(smoother.request.id + 1, controller, address, value, mask);
 	const bool off = (value & mask) == 0;
 	if (off) {

@@ -206,8 +206,17 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 			powerFramebufferId = info->reportedFramebufferId;
 			if (!framebufferPatchFlags.bits.FPFFlags) {
 				// FBC and dynamic FBC are separate bits so a problem can be traced to one of them
-				if (options & RequestFBC)
-					powerFlagMask |= 0x4;  // FBFramebufferCompression
+				if (options & RequestFBC) {
+					if (WIOKit::awaitPublishing(info->videoBuiltin)) {
+						auto raw = WIOKit::readPCIConfigValue(info->videoBuiltin, WIOKit::kIOPCIConfigGraphicsControl, 0, 16);
+						auto gms = (raw >> 8) & 0xff;
+						if ((raw & 0xffff) != 0xffff && gms >= 1 && gms <= 16)
+							stolenMB = gms * 32;
+						else if (gms >= 0xf0 && gms <= 0xfe)
+							stolenMB = (gms - 0xef) * 4;
+					}
+					powerFlagMask |= 0x4; // FBFramebufferCompression
+				}
 				if (options & RequestDynamicFBC)
 					info->videoBuiltin->setProperty("weg-dynamic-fbc-policy", "native only");
 				if (options & RequestCDCLK)
@@ -612,6 +621,9 @@ void IGFX::MMIORegistersWriteSupport::wrapWriteRegister32(void *controller, uint
 		return replacerInjector(controller, address, value);
 	}
 	
+	// Native framebuffer GT reset request. Direct accelerator MMIO can bypass this hook.
+	if (address == 0x941c && value && value != UINT32_MAX)
+		callbackIGFX->modRPSControlPatch.observedReset();
 	// Invoke the original function
 	callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32(controller, address, value);
 	if (callbackIGFX->modMMIORegistersWriteSupport.verbose)
@@ -1221,7 +1233,15 @@ void IGFX::applyPowerFlags(IOService *controller) {
 			// Require a terminator on an entry boundary before changing any flags.
 			if (frame->framebufferId == UINT32_MAX && frame->pad == 0) {
 				if (match) {
-					uint32_t flags = match->flags.value | powerFlagMask;
+					uint32_t mask = powerFlagMask;
+					if (mask & 4) {
+						uint64_t required = static_cast<uint64_t>(match->fStolenMemorySize) * match->fFBMemoryCount + match->fFramebufferMemorySize;
+						if (!match->fFBMemoryCount || !match->fStolenMemorySize || !stolenMB || required > (static_cast<uint64_t>(stolenMB) << 20))
+							mask &= ~4U;
+						controller->setProperty("weg-fbc-dvmt-mb", stolenMB, 32);
+						controller->setProperty("weg-fbc-platform-budget-ok", static_cast<uint32_t>((mask & 4) != 0), 32);
+					}
+					uint32_t flags = match->flags.value | mask;
 					match->flags.value = flags;
 					controller->setProperty("weg-power-framebuffer-flags", flags, 32);
 					return true;

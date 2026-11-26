@@ -214,7 +214,7 @@ private:
 	uint32_t powerOptions {0};
 	uint32_t powerFramebufferId {0};
 	bool powerKblLayout {false};
-	uint32_t powerFlagMask {0};
+	uint32_t powerFlagMask {0}, stolenMB {0};
 	void applyPowerFlags(IOService *controller);
 
 	/**
@@ -1324,6 +1324,26 @@ private:
 		void refreshPolicy();
 		int externalPower(uint64_t now);
 		// igfxrpsc=5: cached AC state (-1 unknown, 0 battery, 1 AC), only touched by the reporting worker
+		uint32_t resetGeneration {0}, snapshotGeneration {0}, busyGeneration {0};
+		uint32_t lastDownWindow {0}, lastIdle {0};
+		bool packageSensor {false}, deadlineBoost {false};
+		uint64_t vblAnchor {0}, vblPeriod {0};
+		uint32_t vblSequence {0}, deadlineRequests {0};
+		uint64_t freqAt {0}, freqBins[32] {};
+		unsigned freqBin {32};
+		uint32_t measuredMHz {0};
+		uint32_t dcPrevious[2] {}, dcEpoch[2] {};
+		uint64_t dcTime[2] {};
+		uint32_t dcRate[2] {UINT32_MAX, UINT32_MAX};
+		bool dcSampling[2] {};
+		void recordDC(unsigned slot, uint32_t value);
+		void recordClock(uint32_t ratio, uint64_t now);
+		bool nearVBL(uint64_t now);
+		uint32_t acGeneration {0}, acConsumed {0}, policyGeneration {0};
+		IONotifier *acNotifier {nullptr};
+		IOService *acProvider {nullptr};
+		static IOReturn powerChanged(void *, void *, UInt32, IOService *, void *, vm_size_t);
+		void sampleVBL();
 		int acState {-1};
 		uint64_t acCheckedAt {0}, acCheckInterval {0}, acEpoch {0};
 		// 0 native, 1 middle tier, 2 maximum. Updated by the reporting worker.
@@ -1344,7 +1364,7 @@ private:
 		// again; UINT32_MAX when not read) and per-result sample counts (see BusyResult in kern_igfx_pm.cpp)
 		enum { BusyRawCount = 6 };
 		uint32_t busyRaw[BusyRawCount] {};
-		uint32_t busyResults[8] {};
+		uint32_t busyResults[9] {};
 		// RC6 residency (uncore, readable without ForceWake) at the previous load sample
 		uint32_t busyRc6 {0};
 		uint64_t busyRc6At {0};
@@ -1406,7 +1426,7 @@ private:
 		void *rc6LogCall {nullptr};
 		// Only the sampler may access the snapshot. Bit 1 permanently closes admission.
 		uint32_t rc6Sampler {0};
-		struct Event { uint32_t kind, v0, v1, v2; uint64_t epoch; };
+		struct Event { uint32_t kind, v0, v1, v2; uint64_t epoch; uint32_t generation; };
 		Event logQueue[8] {};
 		unsigned logHead {0}, logCount {0};
 		bool logScheduled {false};
@@ -1448,6 +1468,7 @@ private:
 		bool available {false};
 		void observeDisplayRead(uint32_t address, uint32_t value);
 		void countWake(bool set, uint32_t domains, uint32_t context);
+		void observedReset() { __atomic_fetch_add(&resetGeneration, 1U, __ATOMIC_ACQ_REL); }
 		void wakeHookReady() { __atomic_store_n(&wakeHookInstalled, true, __ATOMIC_RELEASE); }
 		~RPSControlPatch() override { deinit(); }
 		

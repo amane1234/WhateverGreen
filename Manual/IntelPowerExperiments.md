@@ -49,3 +49,19 @@ Use `igfxrpsc=5` for the three-tier Gen9 policy. Below 60% measured busy, preser
 Mode 5 publishes estimated observed time in frequency bands below 500 MHz, 500–899 MHz and at least 900 MHz under `weg-gt-*`. Display observation (`igfxpwr=1`) reports PSR1 buffer-off and PSR2 deep-sleep milliseconds alongside each stream's covered milliseconds. The profilers count intervals up to 250 ms between observations in the same state, exclude wake boundaries when a wake timestamp is available and omit unobserved time. The two PSR streams have independent coverage.
 
 With `-igfxrc6fix`, the monitor reports a verified restore only after residency advances. A failed verification suspends recovery. A new wake epoch or a minute of stable driver enablement rearms it. With `-igfxbls`, a one-shot timer schedules each fade step on the existing workloop.
+
+## Reset-aware recovery and additional counters
+
+On KBL/CFL/CML, RC6 repair requires every dependent register to match the saved driver configuration. It writes only the RC6 enable bit and verifies the readback and subsequent residency movement. If the configuration is incomplete it waits for Apple to reinitialize it. A native framebuffer GDRST write observed through the shared MMIO hook invalidates the snapshot and load history. The generation counts observed reset requests; direct accelerator / firmware resets can bypass this hook. Checks around a write cannot serialize it against unobserved driver accesses.
+
+Modes 3–5 can derive busy time from one minus the down-window idle fraction when the up-window sample is unavailable and RP_CONTROL selects down-idle-average. The status and per-path counters report which source produced a sample. Invalid or repeated samples leave the native frequency request in effect.
+
+Mode 5 applies the more restrictive of the worker core's and the supported package sensor's thermal limits. Native battery change notifications invalidate the cached power policy until the next worker refresh. The periodic lookup remains available for providers that do not deliver notifications.
+
+Mode 5 publishes a 256-byte little-endian histogram in `weg-gt-50mhz-bins-ms`. Each UInt64 is estimated observed milliseconds; bin 0 covers frequencies below 50 MHz and bin 31 covers 1550 MHz and above. Samples with missing or zero clock readback break coverage. Equal-band observations separated by at most 250 ms contribute time. GPU sleep and missing observations can leave long gaps.
+
+Add `-igfxvblboost` alongside `igfxrpsc=5` to test promotion of an existing intermediate-tier request near the next predicted VBL of the IGPU's framebuffer zero. Only the last tenth of a period and projections younger than six periods qualify. The worker refreshes timing during reporting; coverage is intermittent. Heat, AC/battery policy and EPP keep precedence. `weg-rps-vbl-promotions` counts policy decisions. VBL timing is a display deadline proxy, not a per-command completion deadline.
+
+Gen9 display counters expose DC5/DC6 entries. The `weg-dc5-entries-per-minute` and `weg-dc6-entries-per-minute` properties use native register observations 1–60 seconds apart and exclude counter decreases, observed resets and known wake boundaries. They measure transition frequency. Measuring time spent inside DC5/DC6 requires a separate residency source.
+
+The experimental FBC request checks the integrated GPU's GMS field against the selected framebuffer's memory budget before adding its flag. Unrecognized allocations and insufficient memory suppress the extra request. `weg-fbc-dvmt-mb` and `weg-fbc-platform-budget-ok` report this preflight. Actual compression still depends on the active mode and driver allocations; check `weg-power-fbc-compressing`. Dynamic FBC remains under native policy. The backlight smoother coalesces identical pending nonzero PWM requests and executes screen-off immediately.
