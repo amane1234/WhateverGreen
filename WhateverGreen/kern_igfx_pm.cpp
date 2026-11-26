@@ -509,6 +509,29 @@ int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1,
 	return ret;
 }
 
+namespace {
+// Result of one igfxrpsc=3/4 sample, counted in busyResults and published with the status
+enum BusyResult : uint32_t {
+	BusySampled, BusyNoController, BusyGTAsleep, BusyRPMode, BusyImplausible, BusyUnchanged, BusyResultCount
+};
+constexpr const char *busyStatus[BusyResultCount] {
+	"sampled",
+	"counter unavailable: no framebuffer controller or register read hook",
+	"counter unavailable: GT well asleep (blitter ACK 0)",
+	"counter unavailable: RP_CONTROL not in RP-enabled busy-average mode",
+	"counter unavailable: implausible or changing counter values",
+	"counter unavailable: counters unchanged since the last sample",
+};
+constexpr const char *busyResultKeys[BusyResultCount] {
+	"weg-rps-busy-count-sampled", "weg-rps-busy-count-no-controller", "weg-rps-busy-count-gt-asleep",
+	"weg-rps-busy-count-rp-mode", "weg-rps-busy-count-implausible", "weg-rps-busy-count-unchanged",
+};
+constexpr const char *busyRawKeys[] {
+	"weg-rps-gt-ack-raw", "weg-rps-rp-control-raw", "weg-rps-up-ei-begin", "weg-rps-up-busy", "weg-rps-up-ei-end",
+};
+constexpr size_t busyRawKeyCount = arrsize(busyRawKeys);
+}
+
 // Read only during native PM notifications. No timer or ForceWake request is issued.
 bool IGFX::RPSControlPatch::hardwareBusy(uint64_t now) {
 	uint32_t idle = 0;
@@ -522,22 +545,33 @@ bool IGFX::RPSControlPatch::hardwareBusy(uint64_t now) {
 		const bool stale = !busyNext || now - busyNext > 3 * busySamplePeriod;
 		auto controller = callbackIGFX->defaultController();
 		uint32_t load = UINT32_MAX;
+		uint32_t result = BusyNoController;
+		uint32_t raw[BusyRawCount] {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
 		if (controller && callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32) {
 			auto read = [&](uint32_t reg) { return callbackIGFX->readRegister32(controller, reg); };
-			auto ack = read(FORCEWAKE_ACK_BLITTER_GEN9); // Gen9 GT domain
-			auto ctl = ack != UINT32_MAX && (ack & 0xffff) ? read(0xa024) : UINT32_MAX;
+			auto ack = raw[0] = read(FORCEWAKE_ACK_BLITTER_GEN9); // Gen9 GT domain
+			auto ctl = raw[1] = ack != UINT32_MAX && (ack & 0xffff) ? read(0xa024) : UINT32_MAX;
+			result = ctl == UINT32_MAX ? BusyGTAsleep : BusyRPMode;
 			if (ctl != UINT32_MAX && (ctl & 0xb8) == 0x90) { // RP enabled, UP_BUSY_AVG
-				auto begin = read(0xa050);
-				auto busy = read(0xa054);
-				auto end = read(0xa050);
+				auto begin = raw[2] = read(0xa050);
+				auto busy = raw[3] = read(0xa054);
+				auto end = raw[4] = read(0xa050);
+				result = BusyImplausible;
 				if (end <= 0xffffff && begin >= 128 && end >= begin && busy <= end &&
-					end - begin <= 1 + begin / 50 && read(FORCEWAKE_ACK_BLITTER_GEN9) == ack &&
-					(begin != lastWindow || busy != lastBusy))
-					load = static_cast<uint32_t>(1000ULL * busy / end);
+					end - begin <= 1 + begin / 50 && read(FORCEWAKE_ACK_BLITTER_GEN9) == ack) {
+					result = BusyUnchanged;
+					if (begin != lastWindow || busy != lastBusy) {
+						load = static_cast<uint32_t>(1000ULL * busy / end);
+						result = BusySampled;
+					}
+				}
 				lastWindow = begin;
 				lastBusy = busy;
 			}
 		}
+		for (size_t i = 0; i < BusyRawCount; ++i)
+			__atomic_store_n(&busyRaw[i], raw[i], __ATOMIC_RELAXED);
+		__atomic_fetch_add(&busyResults[result], 1U, __ATOMIC_RELAXED);
 		if (stale || load == UINT32_MAX || load < 600) {
 			busyStreak = 0;
 			busyUntil = 0;
@@ -552,7 +586,7 @@ bool IGFX::RPSControlPatch::hardwareBusy(uint64_t now) {
 			busyUntil = now + 3 * busySamplePeriod;
 		busyNext = now + busySamplePeriod;
 		if (now >= busyPublish) {
-			postRC6Event(RPSEventBusy, load, now < busyUntil, mode);
+			postRC6Event(RPSEventBusy, load, now < busyUntil, result);
 			busyPublish = now + 50 * busySamplePeriod;
 		}
 	}
@@ -602,8 +636,15 @@ void IGFX::RPSControlPatch::reportEvent(const Event &event) {
 			unpublish("weg-rps-busy-permille");
 		else
 			publish("weg-rps-busy-permille", event.v0);
-		publish("weg-rps-busy-status", event.v0 == UINT32_MAX ? "counter unavailable" : "sampled");
+		publish("weg-rps-busy-status", busyStatus[event.v2 < BusyResultCount ? event.v2 : BusyNoController]);
 		publish("weg-rps-high-load", event.v1);
+		// Raw values of the most recent sample (it may be newer than the status), 4294967295 = not read
+		static_assert(busyRawKeyCount == BusyRawCount, "busy raw key count");
+		static_assert(sizeof(busyResults) / sizeof(busyResults[0]) == BusyResultCount, "busy result count");
+		for (size_t i = 0; i < BusyRawCount; ++i)
+			publish(busyRawKeys[i], __atomic_load_n(&busyRaw[i], __ATOMIC_RELAXED));
+		for (size_t i = 0; i < BusyResultCount; ++i)
+			publish(busyResultKeys[i], __atomic_load_n(&busyResults[i], __ATOMIC_RELAXED));
 		return;
 	}
 	if (event.kind == RPSEventEPP) {

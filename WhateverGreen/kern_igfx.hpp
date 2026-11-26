@@ -1323,6 +1323,11 @@ private:
 		uint64_t busySamplePeriod {0}, busyNext {0}, busyPublish {0}, busyUntil {0};
 		unsigned busyStreak {0};
 		uint32_t lastWindow {0}, lastBusy {0}, droppedEvents {0};
+		// igfxrpsc=3/4 diagnostics: raw reads of the last sample (GT ACK, RP_CONTROL, up EI, up busy, up EI
+		// again; UINT32_MAX when not read) and per-result sample counts (see BusyResult in kern_igfx_pm.cpp)
+		enum { BusyRawCount = 5 };
+		uint32_t busyRaw[BusyRawCount] {};
+		uint32_t busyResults[6] {};
 		bool diagnostics {false};
 		uint64_t sampleTime {0}, sampleWall {0}, telemetryInterval {0}, nextTelemetry {0};
 		uint32_t sampleTicks {0};
