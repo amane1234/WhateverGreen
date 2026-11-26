@@ -1403,6 +1403,7 @@ private:
 		uint32_t rc6Restores {0};
 		void publish(const char *key, uint32_t value);
 		void publish(const char *key, const char *value);
+		void unpublish(const char *key);
 		IOReturn (*orgDoPMWork)(void *, uint32_t, void *, void *, void *) {nullptr};
 		static IOReturn wrapDoPMWork(void *controller, uint32_t cmd, void *arg1, void *arg2, void *arg3);
 

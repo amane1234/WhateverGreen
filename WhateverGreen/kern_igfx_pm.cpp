@@ -178,6 +178,11 @@ void IGFX::RPSControlPatch::publish(const char *key, const char *value) {
 		igpu->setProperty(key, value);
 }
 
+void IGFX::RPSControlPatch::unpublish(const char *key) {
+	if (igpu)
+		igpu->removeProperty(key);
+}
+
 void IGFX::RPSControlPatch::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	uint32_t rpsc = 0;
 	if (PE_parse_boot_argn("igfxrpsc", &rpsc, sizeof(rpsc)) ||
@@ -594,7 +599,7 @@ void IGFX::RPSControlPatch::reportEvent(const Event &event) {
 	publish("weg-power-events-dropped", __atomic_load_n(&droppedEvents, __ATOMIC_RELAXED));
 	if (event.kind == RPSEventBusy) {
 		if (event.v0 == UINT32_MAX)
-			igpu->removeProperty("weg-rps-busy-permille");
+			unpublish("weg-rps-busy-permille");
 		else
 			publish("weg-rps-busy-permille", event.v0);
 		publish("weg-rps-busy-status", event.v0 == UINT32_MAX ? "counter unavailable" : "sampled");
@@ -802,7 +807,7 @@ void IGFX::RPSControlPatch::sampleEPP() {
 	__atomic_store_n(&fastBoostUntil, fast ? until : 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&eppEpoch, epoch, __ATOMIC_RELEASE);
 	if (epp == UINT32_MAX)
-		igpu->removeProperty("weg-power-hwp-epp");
+		unpublish("weg-power-hwp-epp");
 	else
 		publish("weg-power-hwp-epp", epp);
 	publish("weg-power-defer-rp0", static_cast<uint32_t>(defer));
@@ -814,7 +819,7 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 	if (!igpu)
 		return;
 	if (event.v0 == UINT32_MAX)
-		igpu->removeProperty("weg-power-rc6-permille");
+		unpublish("weg-power-rc6-permille");
 	else
 		publish("weg-power-rc6-permille", event.v0);
 	publish("weg-power-window-ms", event.v1);
@@ -825,10 +830,10 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 		publishedEpoch = wake;
 		lastClock = UINT32_MAX;
 		for (const auto &reg : displayRegisters)
-			igpu->removeProperty(reg.property);
-		igpu->removeProperty("weg-power-fbc-enabled");
-		igpu->removeProperty("weg-power-fbc-compressing");
-		igpu->removeProperty("weg-power-cdclk-transition-observed");
+			unpublish(reg.property);
+		unpublish("weg-power-fbc-enabled");
+		unpublish("weg-power-fbc-compressing");
+		unpublish("weg-power-cdclk-transition-observed");
 	}
 	const uint32_t seen = __atomic_exchange_n(&seenDisplay, 0U, __ATOMIC_ACQUIRE);
 	for (unsigned i = 0; i < arrsize(displayRegisters); ++i)
@@ -864,7 +869,7 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 			snprintf(key, sizeof(key), "weg-power-fw-%s-ack", domains[i]);
 			auto ack = __atomic_load_n(&wakeAck[i], __ATOMIC_RELAXED);
 			if (ack == UINT32_MAX)
-				igpu->removeProperty(key);
+				unpublish(key);
 			else
 				publish(key, ack);
 
@@ -888,7 +893,7 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 			if (oldest)
 				publish(key, holder);
 			else
-				igpu->removeProperty(key);
+				unpublish(key);
 			// A context that has held a domain for 30 s keeps the GT out of RC6 the whole time
 			if (heldMs >= 30000)
 				suspect |= 1U << i;
