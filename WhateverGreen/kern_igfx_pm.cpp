@@ -543,22 +543,30 @@ int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1,
 namespace {
 // Result of one igfxrpsc=3/4/5 sample, counted in busyResults and published with the status
 enum BusyResult : uint32_t {
-	BusySampled, BusyNoController, BusyGTAsleep, BusyRPMode, BusyImplausible, BusyUnchanged, BusyResultCount
+	BusySampled, BusyNoController, BusyGTAsleep, BusyRPMode, BusyImplausible, BusyUnchanged,
+	BusySampledAwake, BusyRC6Bound, BusyResultCount
 };
+// Without a ForceWake ACK, a GT that spent at least this share (permille) of the time since the previous
+// sample in RC6 was busy at most 1000 minus it, below the 600 permille boost threshold
+constexpr uint32_t BusyRC6BoundPermille = 400;
 constexpr const char *busyStatus[BusyResultCount] {
 	"sampled",
 	"counter unavailable: no framebuffer controller or register read hook",
-	"counter unavailable: GT well asleep (blitter ACK 0)",
+	"counter unavailable: no ForceWake ACK and the GT may be in RC6",
 	"counter unavailable: RP_CONTROL not in RP-enabled busy-average mode",
 	"counter unavailable: implausible or changing counter values",
 	"counter unavailable: counters unchanged since the last sample",
+	"sampled (GT awake by RC6 residency, no ForceWake ACK)",
+	"estimated from RC6 residency: GT mostly idle, busy is an upper bound",
 };
 constexpr const char *busyResultKeys[BusyResultCount] {
 	"weg-rps-busy-count-sampled", "weg-rps-busy-count-no-controller", "weg-rps-busy-count-gt-asleep",
 	"weg-rps-busy-count-rp-mode", "weg-rps-busy-count-implausible", "weg-rps-busy-count-unchanged",
+	"weg-rps-busy-count-sampled-awake", "weg-rps-busy-count-rc6-bound",
 };
 constexpr const char *busyRawKeys[] {
 	"weg-rps-gt-ack-raw", "weg-rps-rp-control-raw", "weg-rps-up-ei-begin", "weg-rps-up-busy", "weg-rps-up-ei-end",
+	"weg-rps-rc6-idle-permille",
 };
 constexpr size_t busyRawKeyCount = arrsize(busyRawKeys);
 }
@@ -571,35 +579,67 @@ unsigned IGFX::RPSControlPatch::hardwareBusy(uint64_t now) {
 	if (lastWake && busyNext && previousBusySample < __atomic_load_n(lastWake, __ATOMIC_RELAXED)) {
 		busyNext = busyUntil = busyPublish = 0;
 		busyStreak = lastWindow = lastBusy = measuredTier = 0;
+		busyRc6 = 0;
+		busyRc6At = 0;
 	}
 	if (now >= busyNext) {
 		const bool stale = !busyNext || now - busyNext > 3 * busySamplePeriod;
 		auto controller = callbackIGFX->defaultController();
 		uint32_t load = UINT32_MAX;
 		uint32_t result = BusyNoController;
-		uint32_t raw[BusyRawCount] {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+		uint32_t raw[BusyRawCount] {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
 		if (controller && callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32) {
 			auto read = [&](uint32_t reg) { return callbackIGFX->readRegister32(controller, reg); };
 			auto ack = raw[0] = read(FORCEWAKE_ACK_BLITTER_GEN9); // Gen9 GT domain
-			auto ctl = raw[1] = ack != UINT32_MAX && (ack & 0xffff) ? read(0xa024) : UINT32_MAX;
-			result = ctl == UINT32_MAX ? BusyGTAsleep : BusyRPMode;
+			const bool forcewake = ack != UINT32_MAX && (ack & 0xffff);
+			// An ACK of 0 only means nobody holds ForceWake: the GT can still be awake and running work.
+			// The RC6 residency counter is uncore, so it tells whether the GT was awake since the last sample.
+			const uint32_t rc6 = read(GEN6_GT_GFX_RC6);
+			const bool rc6Valid = rc6 && rc6 != UINT32_MAX;
+			uint32_t idlePermille = UINT32_MAX;
+			if (rc6Valid && busyRc6 && busyRc6At && now > busyRc6At) {
+				uint64_t elapsed = 0;
+				absolutetime_to_nanoseconds(now - busyRc6At, &elapsed);
+				const uint64_t resident = static_cast<uint32_t>(rc6 - busyRc6) * 1280ULL;
+				if (elapsed && resident <= elapsed + 1000000)
+					idlePermille = static_cast<uint32_t>(min(resident, elapsed) * 1000 / elapsed);
+			}
+			busyRc6 = rc6Valid ? rc6 : 0;
+			busyRc6At = rc6Valid ? now : 0;
+			raw[5] = idlePermille;
+			// Readings are valid only if the GT stayed awake: the ACK is unchanged, or without one, the
+			// GT did not enter RC6 during the reads (a GT in RC6 reads as 0 and its residency advances).
+			auto stillAwake = [&]() {
+				return forcewake ? read(FORCEWAKE_ACK_BLITTER_GEN9) == ack : read(GEN6_GT_GFX_RC6) == rc6;
+			};
+			uint32_t ctl = UINT32_MAX;
+			if (!forcewake && idlePermille != UINT32_MAX && idlePermille >= BusyRC6BoundPermille) {
+				// Mostly in RC6: busy can be no more than the awake share, which is below the boost threshold
+				load = 1000 - idlePermille;
+				result = BusyRC6Bound;
+			} else if (forcewake || (ack != UINT32_MAX && idlePermille != UINT32_MAX)) {
+				ctl = raw[1] = read(0xa024);
+				result = ctl == UINT32_MAX || (!forcewake && ctl == 0) ? BusyGTAsleep : BusyRPMode;
+			} else {
+				result = BusyGTAsleep;
+			}
 			if (ctl != UINT32_MAX && (ctl & 0xb8) == 0x90) { // RP enabled, UP_BUSY_AVG
 				auto begin = raw[2] = read(0xa050);
 				auto busy = raw[3] = read(0xa054);
 				auto end = raw[4] = read(0xa050);
 				result = BusyImplausible;
 				if (end <= 0xffffff && begin >= 128 && end >= begin && busy <= end &&
-					end - begin <= 1 + begin / 50 && read(FORCEWAKE_ACK_BLITTER_GEN9) == ack) {
+					end - begin <= 1 + begin / 50 && stillAwake()) {
 					result = BusyUnchanged;
 					if (begin != lastWindow || busy != lastBusy) {
 						load = static_cast<uint32_t>(1000ULL * busy / end);
-						result = BusySampled;
+						result = forcewake ? BusySampled : BusySampledAwake;
 					}
 				}
 				if (mode == 5 && load != UINT32_MAX) {
 					uint32_t stat = read(0xa01c); // GEN6_RPSTAT1, Gen9 CAGF
 					unsigned ratio = stat >> 23;
-					if (stat != UINT32_MAX && ratio && read(FORCEWAKE_ACK_BLITTER_GEN9) == ack)
+					if (stat != UINT32_MAX && ratio && stillAwake())
 						freqProfile.record(ratio < 30 ? 0 : ratio < 54 ? 1 : 2, now,
 							lastWake ? __atomic_load_n(lastWake, __ATOMIC_RELAXED) : 0);
 					else
@@ -612,7 +652,7 @@ unsigned IGFX::RPSControlPatch::hardwareBusy(uint64_t now) {
 		for (size_t i = 0; i < BusyRawCount; ++i)
 			__atomic_store_n(&busyRaw[i], raw[i], __ATOMIC_RELAXED);
 		__atomic_fetch_add(&busyResults[result], 1U, __ATOMIC_RELAXED);
-		if (mode == 5 && load == UINT32_MAX)
+		if (mode == 5 && result != BusySampled && result != BusySampledAwake)
 			freqProfile.record(3, now, 0);
 		if (stale || load == UINT32_MAX || load < 600) {
 			busyStreak = 0;

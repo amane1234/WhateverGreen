@@ -1342,9 +1342,12 @@ private:
 		uint32_t lastWindow {0}, lastBusy {0}, droppedEvents {0};
 		// igfxrpsc=3/4 diagnostics: raw reads of the last sample (GT ACK, RP_CONTROL, up EI, up busy, up EI
 		// again; UINT32_MAX when not read) and per-result sample counts (see BusyResult in kern_igfx_pm.cpp)
-		enum { BusyRawCount = 5 };
+		enum { BusyRawCount = 6 };
 		uint32_t busyRaw[BusyRawCount] {};
-		uint32_t busyResults[6] {};
+		uint32_t busyResults[8] {};
+		// RC6 residency (uncore, readable without ForceWake) at the previous load sample
+		uint32_t busyRc6 {0};
+		uint64_t busyRc6At {0};
 		bool diagnostics {false};
 		uint64_t sampleTime {0}, sampleWall {0}, telemetryInterval {0}, nextTelemetry {0};
 		uint32_t sampleTicks {0};
