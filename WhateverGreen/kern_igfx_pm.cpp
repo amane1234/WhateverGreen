@@ -539,14 +539,23 @@ int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1,
 			tier = 2;
 			__atomic_fetch_add(&self.deadlineRequests, 1U, __ATOMIC_RELAXED);
 		}
-		tier = min(tier, ceiling);
+		if (tier > ceiling) {
+			__atomic_fetch_add(&self.boostCapped, 1U, __ATOMIC_RELAXED);
+			tier = ceiling;
+		}
 		if (!tier || !rp0)
 			return ret;
 		if (tier == 1) {
 			auto minRatio = (caps >> 16) & 0xff;
 			rp0 = minRatio + (rp0 - minRatio) / 2;
 		}
-		*freq = max(*freq, (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * rp0);
+		const uint32_t target = (GEN9_FREQ_SCALER << GEN9_FREQUENCY_SHIFT) * rp0;
+		if (*freq >= target) {
+			__atomic_fetch_add(&self.boostNative, 1U, __ATOMIC_RELAXED);
+		} else {
+			*freq = target;
+			__atomic_fetch_add(&self.boostRaised[tier - 1], 1U, __ATOMIC_RELAXED);
+		}
 		return ret;
 	}
 	if (rp0)
@@ -916,6 +925,10 @@ void IGFX::RPSControlPatch::reportEvent(const Event &event) {
 				sampleVBL();
 				publish("weg-rps-vbl-promotions", __atomic_load_n(&deadlineRequests, __ATOMIC_RELAXED));
 			}
+			publish("weg-rps-boost-raised-mid", __atomic_load_n(&boostRaised[0], __ATOMIC_RELAXED));
+			publish("weg-rps-boost-raised-max", __atomic_load_n(&boostRaised[1], __ATOMIC_RELAXED));
+			publish("weg-rps-boost-native-higher", __atomic_load_n(&boostNative, __ATOMIC_RELAXED));
+			publish("weg-rps-boost-capped", __atomic_load_n(&boostCapped, __ATOMIC_RELAXED));
 			auto mhz = __atomic_load_n(&measuredMHz, __ATOMIC_RELAXED);
 			if (mhz) publish("weg-gt-last-observed-mhz", mhz);
 			else unpublish("weg-gt-last-observed-mhz");

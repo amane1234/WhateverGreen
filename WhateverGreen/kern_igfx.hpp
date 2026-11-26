@@ -1329,6 +1329,9 @@ private:
 		bool packageSensor {false}, deadlineBoost {false};
 		uint64_t vblAnchor {0}, vblPeriod {0};
 		uint32_t vblSequence {0}, deadlineRequests {0};
+		// igfxrpsc=5 decisions with a nonzero measured tier: request raised to the middle tier or RP0,
+		// Apple's request already as high, and tier lowered by the AC/thermal ceiling
+		uint32_t boostRaised[2] {}, boostNative {0}, boostCapped {0};
 		uint64_t freqAt {0}, freqBins[32] {};
 		unsigned freqBin {32};
 		uint32_t measuredMHz {0};
