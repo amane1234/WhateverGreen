@@ -1292,18 +1292,26 @@ bool BrightnessRequestEventSource::checkForWork() {
 		   cbrightness, tbrightness, distance, smoother->steps);
 	
 	// Process the request
-	if (distance > smoother->threshold) {
-		for (uint32_t i = 1; i < smoother->steps; i++) {
-			uint32_t offset = static_cast<uint32_t>(static_cast<uint64_t>(i) * distance / smoother->steps);
-			uint32_t value = cbrightness < tbrightness ? cbrightness + offset : cbrightness - offset;
-			if (!smoother->writeIfCurrent(request, request.getTargetRegisterValue(value), false))
-				return true;
-			IOSleep(smoother->interval);
-		}
-	} else {
-		DBGLOG("igfx", "BLS: [COMM] Distance is too short. Will set the target value directly.");
+	if (smoother->fadeId != request.id || !smoother->fadeStep) {
+		smoother->fadeId = request.id;
+		smoother->fadeStep = distance > smoother->threshold ? 1 : smoother->steps;
+		smoother->fadeStart = cbrightness;
+		smoother->fadeDeadline = 0;
 	}
-	
+	if (mach_absolute_time() < smoother->fadeDeadline)
+		return false;
+	if (smoother->fadeStep < smoother->steps && smoother->interval) {
+		const uint64_t start = smoother->fadeStart;
+		const auto span = start > tbrightness ? start - tbrightness : tbrightness - start;
+		const auto offset = span * smoother->fadeStep++ / smoother->steps;
+		const uint32_t value = static_cast<uint32_t>(start > tbrightness ? start - offset : start + offset);
+		if (!smoother->writeIfCurrent(request, request.getTargetRegisterValue(value), false))
+			return true;
+		clock_interval_to_deadline(smoother->interval, kMillisecondScale, &smoother->fadeDeadline);
+		if (smoother->fadeTimer->wakeAtTime(smoother->fadeDeadline) == kIOReturnSuccess)
+			return false;
+	}
+	smoother->fadeStep = 0;
 	// Finish by writing the target value
 	bool completed = smoother->writeIfCurrent(request, target, true);
 	[[maybe_unused]] uint64_t enanosecs = getCurrentTimeNs();
@@ -1345,14 +1353,24 @@ void IGFX::BacklightSmoother::init() {
 	requiresMMIORegistersWriteAccess = true;
 }
 
+void IGFX::BacklightSmoother::timerFired(OSObject *, IOTimerEventSource *) {
+	callbackIGFX->modBacklightSmoother.eventSource->notify();
+}
+
 void IGFX::BacklightSmoother::deinit() {
 	// `BacklightSmoother::processKernel()` guarantees that all pointers are nullptr on failure
 	if (workloop != nullptr) {
+		if (fadeTimer) {
+			fadeTimer->cancelTimeout();
+			if (fadeTimer->getWorkLoop())
+				workloop->removeEventSource(fadeTimer);
+		}
 		if (eventSource != nullptr) {
 			if (eventSource->getWorkLoop())
 				workloop->removeEventSource(eventSource);
 			OSSafeReleaseNULL(eventSource);
 		}
+		OSSafeReleaseNULL(fadeTimer);
 		OSSafeReleaseNULL(workloop);
 	}
 	OSSafeReleaseNULL(owner);
@@ -1432,6 +1450,13 @@ void IGFX::BacklightSmoother::processKernel(KernelPatcher &patcher, DeviceInfo *
 	eventSource = BrightnessRequestEventSource::create(owner);
 	if (eventSource == nullptr) {
 		SYSLOG("igfx", "BLS: Failed to create the request event source.");
+		deinit();
+		enabled = false;
+		return;
+	}
+
+	fadeTimer = IOTimerEventSource::timerEventSource(owner, timerFired);
+	if (!fadeTimer || workloop->addEventSource(fadeTimer) != kIOReturnSuccess) {
 		deinit();
 		enabled = false;
 		return;

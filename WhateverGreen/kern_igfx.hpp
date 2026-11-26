@@ -18,6 +18,7 @@
 #include <Headers/kern_disasm.hpp>
 #include <IOKit/IOService.h>
 #include <IOKit/IOLocks.h>
+#include <IOKit/IOTimerEventSource.h>
 
 class IGFX {
 public:
@@ -1319,7 +1320,19 @@ private:
 		 */
 		struct Event;
 		bool rc6Fix {false};
-		bool hardwareBusy(uint64_t now);
+		unsigned hardwareBusy(uint64_t now);
+		void refreshPolicy();
+		// 0 native, 1 middle tier, 2 maximum. Updated by the reporting worker.
+		uint32_t policyLimit {0}, measuredTier {0};
+		uint64_t policyAt {0}, previousBusySample {0};
+		int (*thermalMsr)(uint32_t, uint32_t *, uint32_t *) {nullptr};
+		struct Residency {
+			uint64_t last {0}, ns[3] {};
+			unsigned previous {3};
+			bool writing {false};
+			void record(unsigned state, uint64_t now, uint64_t wake);
+		};
+		Residency freqProfile, psrProfile[2];
 		uint64_t busySamplePeriod {0}, busyNext {0}, busyPublish {0}, busyUntil {0};
 		unsigned busyStreak {0};
 		uint32_t lastWindow {0}, lastBusy {0}, droppedEvents {0};
@@ -1368,7 +1381,9 @@ private:
 		MMIOWriteInjectionDescriptor dDCState {DCStateEnable, filterDCState};
 		void (*orgObservedWake)(void *, bool, uint32_t, uint32_t) {nullptr};
 		static void observeWake(void *, bool, uint32_t, uint32_t);
-		bool rc6HaveSnapshot {false};
+		enum class Recovery { learning, armed, verifying, suspended };
+		Recovery recovery {Recovery::learning};
+		uint64_t restoreEpoch {0};
 		uint32_t rc6GoodCount {0};
 		uint32_t rc6LostCount {0};
 		uint32_t rc6NeverCount {0};
@@ -2400,6 +2415,10 @@ private:
 		 *  A custom event source that adjusts the brightness smoothly
 		 */
 		BrightnessRequestEventSource *eventSource {nullptr};
+		IOTimerEventSource *fadeTimer {nullptr};
+		uint64_t fadeId {0}, fadeDeadline {0};
+		uint32_t fadeStart {0}, fadeStep {0};
+		static void timerFired(OSObject *, IOTimerEventSource *);
 
 		/**
 		 *  [IVB ] Wrapper to write to BLC_PWM_CPU_CTL smoothly

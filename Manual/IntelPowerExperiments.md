@@ -6,7 +6,7 @@ These boot arguments target a display-connected Kaby Lake, Coffee Lake or Comet 
 | --- | --- |
 | `igfxpwr=1` | Collect RC6 residency, observed ForceWake requests, and display registers already read by the Apple framebuffer. No new timer. |
 | `igfxpwr=3` | Diagnostics plus a request for native FBC (`0x4`). `weg-power-fbc-enabled` and `weg-power-fbc-compressing` show whether it is in use. |
-| `igfxpwr=257` | Diagnostics plus a request for dynamic FBC (`0x10`) only. **Known to cause a kernel panic in testing**; FBC alone (`igfxpwr=3`) worked. Use only to investigate it. |
+| `igfxpwr=257` | Observe the native FBC policy. Bit 256 no longer forces dynamic FBC. |
 | `igfxpwr=5` | Diagnostics plus a request for native dynamic CDCLK. `weg-power-cdclk-transition-observed` shows whether the clock changed. |
 | `igfxpwr=9 igfxrpsc=1` | Diagnostics plus an HWP-aware limit on WhateverGreen's adaptive RP0 boost. |
 | `igfxrpsc=3` | Measures GT load from the hardware RP busy counters (`weg-rps-busy-permille`). Never changes the frequency. |
@@ -17,7 +17,7 @@ These boot arguments target a display-connected Kaby Lake, Coffee Lake or Comet 
 | `igfxpwr=129` | Diagnostics plus native modeset: WhateverGreen's forced complete modeset is turned off so the Apple driver decides. |
 | `igfxfcms=0` | Existing independent option with the same modeset effect; `igfxfcms` and `complete-modeset` take precedence over `igfxpwr=128`. |
 
-The decimal mask accepts bits 1 (observe), 2 (FBC), 4 (CDCLK), 8 (EPP, includes observation), 16 (PSR off), 32 (DC5 limit), 64 (DC5/DC6 off), 128 (native modeset) and 256 (dynamic FBC). Bit 2 used to set FBC and dynamic FBC together; they are separate now because the combination panicked. Testing traced the panic to dynamic FBC (bit 256): FBC alone (bit 2) worked. Dynamic FBC lets the Apple driver switch compression on and off at runtime; why that panics on these machines is not known yet (a panic log would show where). FBC keeps its compressed buffer in the iGPU's stolen memory (BIOS DVMT pre-allocated); if that is smaller than the platform entry expects, the buffer can land outside it. Bits 2, 4 and 256 also turn on observation, so the FBC and CDCLK registers can confirm the request. Try one policy change per boot. The display options merge flags into the selected platform entry only; an explicit enabled `framebuffer-flags` patch takes precedence. The Apple controller publishes `weg-power-framebuffer-flags` when a matching entry is found. Existing platform capabilities, panel support, and driver policy still apply. CDCLK additionally depends on Apple's `SupportDynamicCDClk=1` and `dc6config=3`. This experiment manipulates neither PLLs nor display watermarks.
+The decimal mask accepts bits 1 (observe), 2 (FBC), 4 (CDCLK), 8 (EPP, includes observation), 16 (PSR off), 32 (DC5 limit), 64 (DC5/DC6 off), 128 (native modeset) and 256 (observe native dynamic FBC). The forced dynamic FBC path caused a panic in testing. Its underlying cause is unresolved. Bits 2, 4 and 256 also turn on observation, so the FBC and CDCLK registers can confirm the request. Try one policy change per boot. The display options merge flags into the selected platform entry only; an explicit enabled `framebuffer-flags` patch takes precedence. The Apple controller publishes `weg-power-framebuffer-flags` when a matching entry is found. Existing platform capabilities, panel support, and driver policy still apply. CDCLK additionally depends on Apple's `SupportDynamicCDClk=1` and `dc6config=3`. This experiment manipulates neither PLLs nor display watermarks.
 
 ## Reading a sample
 
@@ -41,3 +41,11 @@ ioreg -lw0 -p IOService | grep '"weg-power-'
 * `-igfxrc6fix` is a separate existing control for RC6 repair. It is unnecessary for observation.
 
 For an A/B test, use the same brightness, panel mode, AC/battery state and workload. Compare multiple equal-duration idle and video intervals; include wake, lid open/close and external-display reconnect after changing display flags. Use independent power measurements for watts or battery life.
+
+## Load, power and thermal policy
+
+Use `igfxrpsc=5` for the three-tier Gen9 policy. Below 60% measured busy, preserve the Apple request. At 60% or more, the extra request can reach the midpoint between the fused RPn and RP0. Three consecutive samples at 85% or more permit RP0. Battery power or a sampled core thermal margin of 15–24 °C limits the extra request to the midpoint. A smaller margin, active thermal throttling, missing power data or an unavailable sensor leaves the driver in control. These thresholds are experimental. Policy inputs are sampled in the deferred worker. Notifications drive load sampling at most every 20 ms, backing off to 80 ms below 30% busy or after an invalid counter read.
+
+Mode 5 publishes estimated observed time in frequency bands below 500 MHz, 500–899 MHz and at least 900 MHz under `weg-gt-*`. Display observation (`igfxpwr=1`) reports PSR1 buffer-off and PSR2 deep-sleep milliseconds alongside each stream's covered milliseconds. The profilers count intervals up to 250 ms between observations in the same state, exclude wake boundaries when a wake timestamp is available and omit unobserved time. The two PSR streams have independent coverage.
+
+With `-igfxrc6fix`, the monitor reports a verified restore only after residency advances. A failed verification suspends recovery. A new wake epoch or a minute of stable driver enablement rearms it. With `-igfxbls`, a one-shot timer schedules each fade step on the existing workloop.

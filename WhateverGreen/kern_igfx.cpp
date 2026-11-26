@@ -209,7 +209,7 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 				if (options & RequestFBC)
 					powerFlagMask |= 0x4;  // FBFramebufferCompression
 				if (options & RequestDynamicFBC)
-					powerFlagMask |= 0x10; // FBDynamicFBCEnable
+					info->videoBuiltin->setProperty("weg-dynamic-fbc-policy", "native only");
 				if (options & RequestCDCLK)
 					powerFlagMask |= 0x200000; // FBEnableDynamicCDCLK
 			}
