@@ -1251,9 +1251,10 @@ bool BrightnessRequestEventSource::checkForWork() {
 	// No work if the queue is empty
 	auto irq = IOSimpleLockLockDisableInterrupt(smoother->requestLock);
 	BrightnessRequest request = smoother->request;
-	uint32_t current = request.controller ? IGFX::callbackIGFX->readRegister32(request.controller, request.address) : 0;
+	const bool ready = !smoother->readingPWM;
+	uint32_t current = smoother->initialPWM;
 	IOSimpleLockUnlockEnableInterrupt(smoother->requestLock, irq);
-	if (!request.controller) {
+	if (!request.controller || !ready) {
 		DBGLOG("igfx", "BLS: [COMM] The request is empty. Will wait for the next invocation.");
 		return false;
 	}
@@ -1276,17 +1277,10 @@ bool BrightnessRequestEventSource::checkForWork() {
 	}
 	uint32_t cbrightness = request.getCurrentBrightness(current);
 
-	// A packed PWM register can change frequency while its duty field stays the same.
-	if (current == target) {
-		DBGLOG("igfx", "BLS: [COMM] The request is already completed. Will wait for the next invocation.");
-		auto state = IOSimpleLockLockDisableInterrupt(smoother->requestLock);
-		bool changed = smoother->request.id != request.id;
-		if (!changed)
-			smoother->request.controller = nullptr;
-		IOSimpleLockUnlockEnableInterrupt(smoother->requestLock, state);
-		return changed;
-	}
-	
+	// The submitter sampled the start before waking this workloop.
+	if (current == target)
+		return !smoother->writeIfCurrent(request, target, true);
+
 	uint32_t distance = max(cbrightness, tbrightness) - min(cbrightness, tbrightness);
 	DBGLOG("igfx", "BLS: [COMM] Processing the request: Current = 0x%08x; Target = 0x%08x; Distance = %04u; Steps = %u.",
 		   cbrightness, tbrightness, distance, smoother->steps);
@@ -1526,13 +1520,28 @@ void IGFX::BacklightSmoother::submitRequest(void *controller, uint32_t address, 
 		return;
 	}
 	smoother.request = BrightnessRequest(smoother.request.id + 1, controller, address, value, mask);
+	const auto id = smoother.request.id;
 	const bool off = (value & mask) == 0;
+	smoother.readingPWM = !off;
 	if (off) {
 		smoother.request.controller = nullptr;
 		callbackIGFX->writeRegister32(controller, address, value);
 	}
 	IOSimpleLockUnlockEnableInterrupt(smoother.requestLock, irq);
-	if (!off)
+	if (off)
+		return;
+
+	// The framebuffer caller still owns the controller. Recheck the request
+	// after MMIO so an intervening panel-off or replacement wins.
+	auto start = callbackIGFX->readRegister32(controller, address);
+	irq = IOSimpleLockLockDisableInterrupt(smoother.requestLock);
+	const bool current = smoother.request.id == id && smoother.request.controller == controller;
+	if (current) {
+		smoother.initialPWM = start;
+		smoother.readingPWM = false;
+	}
+	IOSimpleLockUnlockEnableInterrupt(smoother.requestLock, irq);
+	if (current)
 		smoother.eventSource->notify();
 }
 

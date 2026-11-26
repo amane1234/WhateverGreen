@@ -531,8 +531,15 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 	}
 	
 	// Invoke the original function
+	auto generation = (address == 0xA090 || address == 0xA01C) ? callbackIGFX->modRPSControlPatch.currentGeneration() : 0;
 	uint32_t retVal = callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32(controller, address);
 	switch (address) {
+		case 0xA01C:
+			callbackIGFX->modRPSControlPatch.observeFrequency(retVal, generation);
+			break;
+		case 0xA090:
+			callbackIGFX->modRPSControlPatch.observeNativeRC6(retVal, generation);
+			break;
 		case 0x6F840: case 0x6F940: case 0x45504: case 0x80030:
 		case 0x8002C: case 0x43208: case 0x43214: case 0x46000:
 			if (callbackIGFX->powerOptions & (Diagnose | RequestDynamicFBC))

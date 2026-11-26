@@ -1315,16 +1315,31 @@ private:
 		uint64_t busyInterval {0};
 
 		/**
-		 *  RC6 monitor (-igfxrc6fix): records the RC6 configuration the driver programmed and restores it
-		 *  when it was lost (e.g. after S3/S4), and logs RC6 problems it cannot fix
+		 *  RC6 monitor (-igfxrc6fix): reports native RC_CONTROL readback
 		 */
 		struct Event;
 		bool rc6Fix {false};
-		unsigned hardwareBusy(uint64_t now);
+		uint64_t nativeRC6Sample {UINT64_MAX}, nativeWake {0};
+		uint32_t lastReportedControl {0}, resetRequests {0}, discontinuities {0};
+		uint32_t counterGeneration {0}, counterTicks {0};
+		uint64_t counterTime {0};
+		void trackCounter(uint32_t ticks, uint64_t now);
+		unsigned hardwareBusy(uint64_t now, uint32_t heldMask = 0);
+		bool measurementStarted {false};
+		uint64_t lastHeldSample {0}, nextVBLRefresh {0}, nextVBLDiscovery {0};
+		IOService *timingFramebuffer {nullptr};
+		uint32_t vblGeneration {0};
+		bool frequencyProfile {false}, recordingFrequency {false};
+		uint32_t previousBand {32}, frequencyGeneration {0};
+		uint64_t previousFrequencyAt {0}, frequencyBins[32] {}, frequencyWindow {0};
+		void publishFrequency();
+		void (*orgObservedWake)(void *, bool, uint32_t, uint32_t) {nullptr};
+		static void observeWake(void *, bool, uint32_t, uint32_t);
+
 		void refreshPolicy();
 		int externalPower(uint64_t now);
 		// igfxrpsc=5: cached AC state (-1 unknown, 0 battery, 1 AC), only touched by the reporting worker
-		uint32_t resetGeneration {0}, snapshotGeneration {0}, busyGeneration {0};
+		uint32_t resetGeneration {0}, snapshotGeneration {UINT32_MAX}, busyGeneration {0};
 		uint32_t lastDownWindow {0}, lastIdle {0};
 		bool packageSensor {false}, deadlineBoost {false};
 		uint64_t vblAnchor {0}, vblPeriod {0};
@@ -1380,21 +1395,8 @@ private:
 		MMIOWriteInjectionDescriptor dPSR1 {PSR1Control, filterPSR};
 		MMIOWriteInjectionDescriptor dPSR2 {PSR2Control, filterPSR};
 		MMIOWriteInjectionDescriptor dDCState {DCStateEnable, filterDCState};
-		enum class Recovery { learning, armed, verifying, suspended };
-		Recovery recovery {Recovery::learning};
-		uint64_t restoreEpoch {0};
-		uint32_t rc6GoodCount {0};
-		uint32_t rc6LostCount {0};
-		uint32_t rc6NeverCount {0};
-		uint32_t rc6FailedRestores {0};
-		uint32_t rc6LastResidency {0};
-		uint32_t rc6Snapshot[9] {};
 		uint64_t rc6CheckInterval {0};
 		uint64_t rc6NextCheck {0};
-		uint64_t rc6ResidencyChanged {0};
-		uint64_t rc6EnabledSince {0};
-		uint64_t rc6LastRestore {0};
-		uint64_t rc6NextStallReport {0};
 		void *rc6LogCall {nullptr};
 		// Only the sampler may access the snapshot. Bit 1 permanently closes admission.
 		uint32_t rc6Sampler {0};
@@ -1419,14 +1421,14 @@ private:
 		 *  boot kernel log messages are often missing from the unified log
 		 */
 		IORegistryEntry *igpu {nullptr};
-		uint32_t rc6Restores {0};
+
 		void publish(const char *key, uint32_t value);
 		void publish(const char *key, const char *value);
 		void unpublish(const char *key);
 		IOReturn (*orgDoPMWork)(void *, uint32_t, void *, void *, void *) {nullptr};
 		static IOReturn wrapDoPMWork(void *controller, uint32_t cmd, void *arg1, void *arg2, void *arg3);
 
-		void postRC6Event(uint32_t event, uint32_t v0, uint32_t v1 = 0, uint32_t v2 = 0);
+		bool postRC6Event(uint32_t event, uint32_t v0, uint32_t v1 = 0, uint32_t v2 = 0);
 		static void logRC6(void *param0, void *param1);
 
 		bool patchRCSCheck(mach_vm_address_t& start);
@@ -1439,7 +1441,20 @@ private:
 		 */
 		bool available {false};
 		void observeDisplayRead(uint32_t address, uint32_t value);
-		void observedReset() { __atomic_fetch_add(&resetGeneration, 1U, __ATOMIC_ACQ_REL); }
+		uint32_t currentGeneration() const { return __atomic_load_n(&resetGeneration, __ATOMIC_ACQUIRE); }
+		void observedReset() {
+			__atomic_fetch_add(&resetRequests, 1U, __ATOMIC_RELAXED);
+			__atomic_fetch_add(&resetGeneration, 1U, __ATOMIC_ACQ_REL);
+		}
+		bool wantsWakeHook() const { return observe || mode >= 3; }
+		void wakeRequest(bool set, uint32_t domains, uint32_t context);
+		uint32_t lastGTReleaseAck {UINT32_MAX};
+		void observeFrequency(uint32_t value, uint32_t generation);
+		void observeNativeRC6(uint32_t value, uint32_t generation) {
+			if (rc6Fix)
+				__atomic_store_n(&nativeRC6Sample, (static_cast<uint64_t>(generation) << 32) | value, __ATOMIC_RELEASE);
+		}
+
 		~RPSControlPatch() override { deinit(); }
 		
 		// MARK: Patch Submodule IMP
@@ -2401,6 +2416,8 @@ private:
 		 *  A list of pending brightness adjustment requests
 		 */
 		BrightnessRequest request;
+		uint32_t initialPWM {0};
+		bool readingPWM {false};
 		IOSimpleLock *requestLock {nullptr};
 		bool writeIfCurrent(const BrightnessRequest &active, uint32_t value, bool final);
 
