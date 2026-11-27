@@ -227,6 +227,12 @@ private:
 	IORegistryEntry *fbcGuardDevice {nullptr};
 	void (*orgUpdateFBC)(void *, uint32_t) {nullptr};
 	static void wrapUpdateFBC(void *framebuffer, uint32_t event);
+	void (*orgWriteFBCControl)(void *, uint32_t) {nullptr};
+	static void wrapWriteFBCControl(void *controller, uint32_t value);
+	mach_vm_address_t fbcTimerCallback {0};
+	uint64_t fbcSkipped {0}, fbcPassed {0}, fbcTimerOn {0}, fbcTimerOff {0};
+	uint64_t fbcStatusReads {0}, fbcCompressedReads {0};
+	bool traceFBC {false};
 
 	/**
 	 *  IGPU support

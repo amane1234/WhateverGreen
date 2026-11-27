@@ -1024,6 +1024,11 @@ void IGFX::RPSControlPatch::observeDisplayRead(uint32_t address, uint32_t value)
 	static_assert(arrsize(displayRegisters) == DisplayRegisterCount, "display register cache size");
 	if (value == UINT32_MAX)
 		return;
+	if (address == 0x43214 && __atomic_load_n(&callbackIGFX->traceFBC, __ATOMIC_ACQUIRE)) {
+		__atomic_fetch_add(&callbackIGFX->fbcStatusReads, 1ULL, __ATOMIC_RELAXED);
+		if (value & 0xFFF)
+			__atomic_fetch_add(&callbackIGFX->fbcCompressedReads, 1ULL, __ATOMIC_RELAXED);
+	}
 	for (unsigned i = 0; i < arrsize(displayRegisters); ++i) {
 		if (address == displayRegisters[i].address) {
 			__atomic_store_n(&displayValues[i], value, __ATOMIC_RELAXED);
@@ -1068,6 +1073,17 @@ void IGFX::RPSControlPatch::sampleEPP() {
 void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 	if (!igpu)
 		return;
+	if (__atomic_load_n(&callbackIGFX->traceFBC, __ATOMIC_ACQUIRE)) {
+		auto publishCounter = [&](const char *key, const uint64_t &counter) {
+			igpu->setProperty(key, __atomic_load_n(&counter, __ATOMIC_RELAXED), 64);
+		};
+		publishCounter("weg-fbc-skipped-no-timer", callbackIGFX->fbcSkipped);
+		publishCounter("weg-fbc-updates-forwarded", callbackIGFX->fbcPassed);
+		publishCounter("weg-fbc-timer-on-requests", callbackIGFX->fbcTimerOn);
+		publishCounter("weg-fbc-timer-off-requests", callbackIGFX->fbcTimerOff);
+		publishCounter("weg-fbc-status-reads", callbackIGFX->fbcStatusReads);
+		publishCounter("weg-fbc-compressed-reads", callbackIGFX->fbcCompressedReads);
+	}
 	if (event.v0 == UINT32_MAX)
 		unpublish("weg-power-rc6-permille");
 	else

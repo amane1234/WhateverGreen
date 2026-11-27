@@ -361,10 +361,27 @@ void IGFX::wrapUpdateFBC(void *framebuffer, uint32_t event) {
 	// Events 1 and 4 can arm the transaction timer. Other events may cancel
 	// it when a transition is pending. Preserve native idle cleanup otherwise.
 	if (event == 1 || event == 4 || getMember<uint8_t>(controller, 0x1B68) == 1) {
-		if (!getMember<void *>(controller, 0x1B60))
+		if (!getMember<void *>(controller, 0x1B60)) {
+			if (__atomic_load_n(&callbackIGFX->traceFBC, __ATOMIC_RELAXED))
+				__atomic_fetch_add(&callbackIGFX->fbcSkipped, 1ULL, __ATOMIC_RELAXED);
 			return;
+		}
 	}
+	if (__atomic_load_n(&callbackIGFX->traceFBC, __ATOMIC_RELAXED))
+		__atomic_fetch_add(&callbackIGFX->fbcPassed, 1ULL, __ATOMIC_RELAXED);
 	callbackIGFX->orgUpdateFBC(framebuffer, event);
+}
+
+void IGFX::wrapWriteFBCControl(void *controller, uint32_t value) {
+	// Verified return sites of the two native WriteFBCControl calls inside
+	// TransactionCountTimerFired in CFL 24H232. Other callers include modesets.
+	auto caller = reinterpret_cast<mach_vm_address_t>(__builtin_return_address(0));
+	auto offset = caller - callbackIGFX->fbcTimerCallback;
+	if (offset == 0x78 && (value & (1U << 31)))
+		__atomic_fetch_add(&callbackIGFX->fbcTimerOn, 1ULL, __ATOMIC_RELAXED);
+	else if (offset == 0xB4 && !(value & (1U << 31)))
+		__atomic_fetch_add(&callbackIGFX->fbcTimerOff, 1ULL, __ATOMIC_RELAXED);
+	callbackIGFX->orgWriteFBCControl(controller, value);
 }
 
 bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -421,6 +438,18 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 				if (patcher.routeMultiple(index, &route, 1, address, size)) {
 					fbcGuardDevice->setProperty("weg-fbc-timer-guard", "installed");
 					SYSLOG("igfx", "FBC timer guard installed");
+					if (powerOptions & Diagnose) {
+						fbcTimerCallback = patcher.solveSymbol(index, "__ZN31AppleIntelFramebufferController26TransactionCountTimerFiredEv", address, size);
+						KernelPatcher::RouteRequest writeRoute("__ZN31AppleIntelFramebufferController15WriteFBCControlEj",
+							wrapWriteFBCControl, orgWriteFBCControl);
+						if (fbcTimerCallback && patcher.routeMultiple(index, &writeRoute, 1, address, size)) {
+							__atomic_store_n(&traceFBC, true, __ATOMIC_RELEASE);
+							fbcGuardDevice->setProperty("weg-fbc-trace", "installed");
+						} else {
+							patcher.clearError();
+							fbcGuardDevice->setProperty("weg-fbc-trace", "unavailable");
+						}
+					}
 				} else {
 					fbcGuardDevice->setProperty("weg-fbc-timer-guard", "route failed");
 					SYSLOG("igfx", "FBC timer guard unavailable: failed to route UpdateFBC");
