@@ -1093,6 +1093,12 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 			publish("weg-fbc-hw-last-control", control);
 			publish("weg-fbc-hw-last-status2", status);
 		}
+		auto pool = __atomic_load_n(&callbackIGFX->fbcMemPool, __ATOMIC_RELAXED);
+		if (pool != UINT32_MAX) {
+			publish("weg-fbc-mem-pool", pool);
+			publish("weg-fbc-mem-unit", __atomic_load_n(&callbackIGFX->fbcMemUnit, __ATOMIC_RELAXED));
+			publish("weg-fbc-mem-feature-after", __atomic_load_n(&callbackIGFX->fbcFeature, __ATOMIC_RELAXED));
+		}
 	}
 	if (event.v0 == UINT32_MAX)
 		unpublish("weg-power-rc6-permille");

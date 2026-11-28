@@ -182,6 +182,9 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 			fbcGuardDevice->retain();
 			fbcGuardDevice->setProperty("weg-fbc-timer-guard", "waiting for CFL framebuffer");
 		}
+		uint32_t fbcMargin = 0;
+		if (PE_parse_boot_argn("igfxfbcmargin", &fbcMargin, sizeof(fbcMargin)) && fbcMargin)
+			checkFBCMargin(info->videoBuiltin, fbcMargin);
 		applyFramebufferPatch = loadPatchesFromDevice(info->videoBuiltin, info->reportedFramebufferId);
 
 #ifdef DEBUG
@@ -282,7 +285,7 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		
 		// Ideally, we could get rid of these two lambda expressions
 		auto requiresFramebufferPatches = [this]() {
-			if (applyFramebufferPatch || hdmiAutopatch || powerFlagMask || guardFBCTimer)
+			if (applyFramebufferPatch || hdmiAutopatch || powerFlagMask || guardFBCTimer || fbcMarginMB)
 				return true;
 			if (dumpFramebufferToDisk || dumpPlatformTable)
 				return true;
@@ -368,8 +371,13 @@ void IGFX::wrapUpdateFBC(void *framebuffer, uint32_t event) {
 		}
 	}
 	const bool trace = __atomic_load_n(&callbackIGFX->traceFBC, __ATOMIC_RELAXED);
-	if (trace)
+	if (trace) {
 		__atomic_fetch_add(&callbackIGFX->fbcPassed, 1ULL, __ATOMIC_RELAXED);
+		// AppleIntelFramebufferController fields of 24H232 (initStolenMemory / FBMemMgr_Init / getFBCControl)
+		__atomic_store_n(&callbackIGFX->fbcMemPool, getMember<uint32_t>(controller, 0x2C48), __ATOMIC_RELAXED);
+		__atomic_store_n(&callbackIGFX->fbcMemUnit, getMember<uint32_t>(controller, 0x2C4C), __ATOMIC_RELAXED);
+		__atomic_store_n(&callbackIGFX->fbcFeature, static_cast<uint32_t>(getMember<uint8_t>(controller, 0x38A0)), __ATOMIC_RELAXED);
+	}
 	callbackIGFX->orgUpdateFBC(framebuffer, event);
 	if (trace)
 		callbackIGFX->sampleFBCHardware(controller);
@@ -418,6 +426,91 @@ void IGFX::wrapWriteFBCControl(void *controller, uint32_t value) {
 	// Force the next sample so the state right after Apple's write is seen.
 	__atomic_store_n(&callbackIGFX->fbcHwNext, 0ULL, __ATOMIC_RELAXED);
 	callbackIGFX->sampleFBCHardware(controller);
+}
+
+void IGFX::checkFBCMargin(IORegistryEntry *device, uint32_t margin) {
+	if (!fbcGuardDevice) {
+		fbcGuardDevice = device;
+		fbcGuardDevice->retain();
+	}
+	auto status = [&](const char *text) {
+		fbcGuardDevice->setProperty("weg-fbc-margin-status", text);
+		SYSLOG("igfx", "FBC margin: %s", text);
+	};
+	if (margin >= 8)
+		return status("unchanged: the margin must be 1 to 7 MiB");
+	auto pci = OSDynamicCast(IOPCIDevice, device);
+	if (!pci || !WIOKit::awaitPublishing(pci))
+		return status("refused: GPU PCI device unavailable");
+
+	// Data of stolen memory: base from BDSM, size from the GGC GMS field
+	const uint32_t ggc = WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigGraphicsControl, 0, 16);
+	const uint32_t gms = (ggc >> 8) & 0xFF;
+	uint32_t stolen = 0;
+	if (ggc != 0xFFFF && gms >= 1 && gms <= 16)
+		stolen = gms * 32;
+	else if (gms == 0x20 || gms == 0x30 || gms == 0x40)
+		stolen = gms / 0x10 * 512;
+	else if (gms >= 0xF0 && gms <= 0xFE)
+		stolen = (gms - 0xEF) * 4;
+	const uint64_t bdsm = WIOKit::readPCIConfigValue(pci, 0xB4, 0, 32) & 0xFFF00000;
+	if (!stolen || !bdsm)
+		return status("refused: stolen memory size or base unknown");
+
+	auto map = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+	if (!map || map->getLength() < 0x1082C4) {
+		OSSafeReleaseNULL(map);
+		return status("refused: GPU MMIO unavailable");
+	}
+	// GEN6_STOLEN_RESERVED: bit 0 enable, bits 8:7 size (1/2/4/8 MiB), bits 31:20 base (as i915 reads it)
+	const uint32_t reserved = OSReadLittleInt32(reinterpret_cast<volatile void *>(map->getVirtualAddress()), 0x1082C0);
+	map->release();
+	fbcGuardDevice->setProperty("weg-stolen-reserved-raw", reserved, 32);
+	if (reserved == UINT32_MAX)
+		return status("refused: stolen reserved register unreadable");
+	const uint32_t reservedMB = (reserved & 1) ? 1U << ((reserved >> 7) & 3) : 0;
+	fbcGuardDevice->setProperty("weg-stolen-reserved-mb", reservedMB, 32);
+	if (reservedMB && (reserved & 0xFFF00000) + (static_cast<uint64_t>(reservedMB) << 20) != bdsm + (static_cast<uint64_t>(stolen) << 20))
+		return status("refused: the reserved region is not at the top of stolen memory");
+	if (margin < reservedMB)
+		return status("refused: the hardware reserves more than the requested margin");
+	fbcMarginMB = margin;
+	status("waiting for the 24H232 CFL framebuffer");
+}
+
+void IGFX::applyFBCMargin(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (!matchesFBCTimerLayout(address, size)) {
+		fbcGuardDevice->setProperty("weg-fbc-margin-status", "not applied: unrecognized framebuffer UUID");
+		return;
+	}
+	auto function = patcher.solveSymbol(index, "__ZN31AppleIntelFramebufferController13FBMemMgr_InitEv", address, size);
+	if (!function) {
+		patcher.clearError();
+		fbcGuardDevice->setProperty("weg-fbc-margin-status", "not applied: FBMemMgr_Init not found");
+		return;
+	}
+	// movl 0x2c48(%rbx), %edi; movq %rdi, -0x50(%rbp); addl $-0x800000, %edi; cmpl %edi, %edx; jb
+	static const uint8_t find[] = {
+		0x8B, 0xBB, 0x48, 0x2C, 0x00, 0x00, 0x48, 0x89, 0x7D, 0xB0,
+		0x81, 0xC7, 0x00, 0x00, 0x80, 0xFF, 0x39, 0xFA, 0x72, 0x19
+	};
+	uint8_t replace[sizeof(find)];
+	memcpy(replace, find, sizeof(find));
+	const uint32_t imm = 0U - (fbcMarginMB << 20);
+	memcpy(&replace[12], &imm, sizeof(imm));
+	auto kext = currentFramebuffer && currentFramebuffer->loadIndex == index ? currentFramebuffer : currentFramebufferOpt;
+	KernelPatcher::LookupPatch patch {kext, find, replace, sizeof(find), 1};
+	patcher.clearError();
+	patcher.applyLookupPatch(&patch, reinterpret_cast<uint8_t *>(function), 0x600);
+	if (patcher.getError() == KernelPatcher::Error::NoError) {
+		char text[48];
+		snprintf(text, sizeof(text), "applied: %u MiB", fbcMarginMB);
+		fbcGuardDevice->setProperty("weg-fbc-margin-status", text);
+		SYSLOG("igfx", "FBC margin lowered to %u MiB", fbcMarginMB);
+	} else {
+		patcher.clearError();
+		fbcGuardDevice->setProperty("weg-fbc-margin-status", "not applied: instruction pattern not found");
+	}
 }
 
 bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -497,6 +590,8 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 				SYSLOG("igfx", "FBC timer guard unavailable: unrecognized framebuffer UUID");
 			}
 		}
+		if (fbcMarginMB && getRealFramebuffer(index) == &kextIntelCFLFb)
+			applyFBCMargin(patcher, index, address, size);
 
 		// Note that the order is reversed at this stage
 		// We first process shared submodules

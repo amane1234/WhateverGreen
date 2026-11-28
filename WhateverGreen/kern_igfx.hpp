@@ -240,6 +240,18 @@ private:
 	uint32_t fbcHwControl {UINT32_MAX}, fbcHwStatus {UINT32_MAX};
 	bool fbcHwSampling {false};
 	void sampleFBCHardware(void *controller);
+	// 24H232 controller fields read under the trace: stolen pool, per-framebuffer unit, FBC feature flag
+	uint32_t fbcMemPool {UINT32_MAX}, fbcMemUnit {UINT32_MAX}, fbcFeature {UINT32_MAX};
+
+	/**
+	 *  igfxfbcmargin=MiB (24H232 CFL only): FBMemMgr_Init keeps a fixed 8 MiB at the top of the stolen
+	 *  pool free (unit + fbmem + 1 MiB must stay below pool - 8 MiB) and turns FBC off otherwise. The top
+	 *  of stolen memory holds the hardware reserved region (GEN6_STOLEN_RESERVED, 1-8 MiB). The margin is
+	 *  only lowered when that region is at the top and no larger than the requested margin.
+	 */
+	uint32_t fbcMarginMB {0};
+	void checkFBCMargin(IORegistryEntry *device, uint32_t margin);
+	void applyFBCMargin(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 
 	/**
 	 *  IGPU support
