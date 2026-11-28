@@ -159,7 +159,6 @@ void IGFX::init() {
 
 void IGFX::deinit() {
 	OSSafeReleaseNULL(fbcGuardDevice);
-	OSSafeReleaseNULL(fbcMarginDevice);
 	// Deinitialize each submodule
 	for (auto submodule : submodules)
 		submodule->deinit();
@@ -182,14 +181,6 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 			fbcGuardDevice = info->videoBuiltin;
 			fbcGuardDevice->retain();
 			fbcGuardDevice->setProperty("weg-fbc-timer-guard", "waiting for CFL framebuffer");
-		}
-		// The hardware check runs when the framebuffer loads, once the PCI device is fully configured.
-		uint32_t fbcMargin = 0;
-		if (!fbcMarginDevice && PE_parse_boot_argn("igfxfbcmargin", &fbcMargin, sizeof(fbcMargin)) && fbcMargin) {
-			fbcMarginMB = fbcMargin;
-			fbcMarginDevice = info->videoBuiltin;
-			fbcMarginDevice->retain();
-			fbcMarginDevice->setProperty("weg-fbc-margin-status", "waiting for the 24H232 CFL framebuffer");
 		}
 		applyFramebufferPatch = loadPatchesFromDevice(info->videoBuiltin, info->reportedFramebufferId);
 
@@ -220,30 +211,34 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 			PE_parse_boot_argn("igfxpwr", &options, sizeof(options)) && !(options & ~AllPowerOptions)) {
 			powerOptions = options;
 			powerFramebufferId = info->reportedFramebufferId;
-			if (!framebufferPatchFlags.bits.FPFFlags) {
-				// Bit 256 alone remains an observation option. Keep testing the dynamic
-				// path independent of forcing base FBC in the same boot.
-				const bool dynamic = (options & RequestDynamicFBC) && checkKernelArgument("-igfxdynfbc");
-				if ((options & RequestFBC) || dynamic) {
-					if (WIOKit::awaitPublishing(info->videoBuiltin)) {
-						auto raw = WIOKit::readPCIConfigValue(info->videoBuiltin, WIOKit::kIOPCIConfigGraphicsControl, 0, 16);
-						auto gms = (raw >> 8) & 0xff;
-						// Gen9 GGC GMS: 0x01-0x10 in 32 MB units, 0x20/0x30/0x40 = 1/1.5/2 GB, 0xF0-0xFE = 4-60 MB
-						if ((raw & 0xffff) == 0xffff)
-							gms = UINT32_MAX;
-						else if (gms >= 1 && gms <= 16)
-							stolenMB = gms * 32;
-						else if (gms == 0x20 || gms == 0x30 || gms == 0x40)
-							stolenMB = gms / 0x10 * 512;
-						else if (gms >= 0xf0 && gms <= 0xfe)
-							stolenMB = (gms - 0xef) * 4;
-						info->videoBuiltin->setProperty("weg-fbc-gms-raw", gms, 32);
-					}
+			// Bit 256 alone remains an observation option. Keep testing the dynamic
+			// path independent of forcing base FBC in the same boot.
+			const bool dynamic = !framebufferPatchFlags.bits.FPFFlags && (options & RequestDynamicFBC) && checkKernelArgument("-igfxdynfbc");
+			if ((options & RequestFBC) || dynamic) {
+				if (WIOKit::awaitPublishing(info->videoBuiltin)) {
+					auto raw = WIOKit::readPCIConfigValue(info->videoBuiltin, WIOKit::kIOPCIConfigGraphicsControl, 0, 16);
+					auto gms = (raw >> 8) & 0xff;
+					// Gen9 GGC GMS: 0x01-0x10 in 32 MB units, 0x20/0x30/0x40 = 1/1.5/2 GB, 0xF0-0xFE = 4-60 MB
+					if ((raw & 0xffff) == 0xffff)
+						gms = UINT32_MAX;
+					else if (gms >= 1 && gms <= 16)
+						stolenMB = gms * 32;
+					else if (gms == 0x20 || gms == 0x30 || gms == 0x40)
+						stolenMB = gms / 0x10 * 512;
+					else if (gms >= 0xf0 && gms <= 0xfe)
+						stolenMB = (gms - 0xef) * 4;
+					info->videoBuiltin->setProperty("weg-fbc-gms-raw", gms, 32);
+				}
+				// The compressed buffer is reserved even when an explicit framebuffer-flags patch sets FBC.
+				reserveFBCMemory = true;
+				if (!framebufferPatchFlags.bits.FPFFlags) {
 					if (options & RequestFBC)
 						powerFlagMask |= BaseFBCFlag;
 					else if (dynamic)
 						powerFlagMask |= DynamicFBCFlag;
 				}
+			}
+			if (!framebufferPatchFlags.bits.FPFFlags) {
 				if (options & RequestDynamicFBC)
 					info->videoBuiltin->setProperty("weg-dynamic-fbc-policy",
 						!dynamic ? "native only" : (options & RequestFBC) ? "skipped: base FBC also requested" : "check framebuffer");
@@ -291,7 +286,7 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 		
 		// Ideally, we could get rid of these two lambda expressions
 		auto requiresFramebufferPatches = [this]() {
-			if (applyFramebufferPatch || hdmiAutopatch || powerFlagMask || guardFBCTimer || fbcMarginMB)
+			if (applyFramebufferPatch || hdmiAutopatch || powerFlagMask || reserveFBCMemory || guardFBCTimer)
 				return true;
 			if (dumpFramebufferToDisk || dumpPlatformTable)
 				return true;
@@ -436,97 +431,6 @@ void IGFX::wrapWriteFBCControl(void *controller, uint32_t value) {
 	callbackIGFX->sampleFBCHardware(controller);
 }
 
-bool IGFX::checkFBCMargin() {
-	auto device = fbcMarginDevice;
-	const uint32_t margin = fbcMarginMB;
-	auto status = [&](const char *text) {
-		device->setProperty("weg-fbc-margin-status", text);
-		SYSLOG("igfx", "FBC margin: %s", text);
-		return false;
-	};
-	if (margin >= 8)
-		return status("unchanged: the margin must be 1 to 7 MiB");
-	auto pci = OSDynamicCast(IOPCIDevice, device);
-	if (!pci)
-		return status("refused: GPU PCI device unavailable");
-
-	// Stolen memory from the GPU's own config space: size from the GGC mirror (0x50, GMS field), base from
-	// BSM (0x5C, bits 31:20), as i915 reads it. 0xB0/0xB4 hold BDSM/BGSM only in the host bridge.
-	const uint16_t ggc = pci->configRead16(WIOKit::kIOPCIConfigGraphicsControl);
-	const uint32_t bdsmRaw = pci->configRead32(0x5C);
-	device->setProperty("weg-fbc-ggc-raw", ggc, 16);
-	device->setProperty("weg-fbc-bsm-raw", bdsmRaw, 32);
-	const uint32_t gms = (ggc >> 8) & 0xFF;
-	uint32_t stolen = 0;
-	if (ggc != 0xFFFF && gms >= 1 && gms <= 16)
-		stolen = gms * 32;
-	else if (gms == 0x20 || gms == 0x30 || gms == 0x40)
-		stolen = gms / 0x10 * 512;
-	else if (gms >= 0xF0 && gms <= 0xFE)
-		stolen = (gms - 0xEF) * 4;
-	const uint64_t bdsm = bdsmRaw == UINT32_MAX ? 0 : bdsmRaw & 0xFFF00000;
-	if (!stolen)
-		return status("refused: stolen memory size unknown (weg-fbc-ggc-raw)");
-	if (!bdsm)
-		return status("refused: stolen memory base unknown (weg-fbc-bsm-raw)");
-
-	auto map = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
-	if (!map || map->getLength() < 0x1082C4) {
-		OSSafeReleaseNULL(map);
-		return status("refused: GPU MMIO unavailable");
-	}
-	// GEN6_STOLEN_RESERVED: bit 0 enable, bits 8:7 size (1/2/4/8 MiB), bits 31:20 base (as i915 reads it)
-	const uint32_t reserved = OSReadLittleInt32(reinterpret_cast<volatile void *>(map->getVirtualAddress()), 0x1082C0);
-	map->release();
-	device->setProperty("weg-stolen-reserved-raw", reserved, 32);
-	if (reserved == UINT32_MAX)
-		return status("refused: stolen reserved register unreadable");
-	const uint32_t reservedMB = (reserved & 1) ? 1U << ((reserved >> 7) & 3) : 0;
-	device->setProperty("weg-stolen-reserved-mb", reservedMB, 32);
-	if (reservedMB && (reserved & 0xFFF00000) + (static_cast<uint64_t>(reservedMB) << 20) != bdsm + (static_cast<uint64_t>(stolen) << 20))
-		return status("refused: the reserved region is not at the top of stolen memory");
-	if (margin < reservedMB)
-		return status("refused: the hardware reserves more than the requested margin");
-	return true;
-}
-
-void IGFX::applyFBCMargin(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-	if (!matchesFBCTimerLayout(address, size)) {
-		fbcMarginDevice->setProperty("weg-fbc-margin-status", "not applied: unrecognized framebuffer UUID");
-		return;
-	}
-	if (!checkFBCMargin())
-		return;
-	auto function = patcher.solveSymbol(index, "__ZN31AppleIntelFramebufferController13FBMemMgr_InitEv", address, size);
-	if (!function) {
-		patcher.clearError();
-		fbcMarginDevice->setProperty("weg-fbc-margin-status", "not applied: FBMemMgr_Init not found");
-		return;
-	}
-	// movl 0x2c48(%rbx), %edi; movq %rdi, -0x50(%rbp); addl $-0x800000, %edi; cmpl %edi, %edx; jb
-	static const uint8_t find[] = {
-		0x8B, 0xBB, 0x48, 0x2C, 0x00, 0x00, 0x48, 0x89, 0x7D, 0xB0,
-		0x81, 0xC7, 0x00, 0x00, 0x80, 0xFF, 0x39, 0xFA, 0x72, 0x19
-	};
-	uint8_t replace[sizeof(find)];
-	memcpy(replace, find, sizeof(find));
-	const uint32_t imm = 0U - (fbcMarginMB << 20);
-	memcpy(&replace[12], &imm, sizeof(imm));
-	auto kext = currentFramebuffer && currentFramebuffer->loadIndex == index ? currentFramebuffer : currentFramebufferOpt;
-	KernelPatcher::LookupPatch patch {kext, find, replace, sizeof(find), 1};
-	patcher.clearError();
-	patcher.applyLookupPatch(&patch, reinterpret_cast<uint8_t *>(function), 0x600);
-	if (patcher.getError() == KernelPatcher::Error::NoError) {
-		char text[48];
-		snprintf(text, sizeof(text), "applied: %u MiB", fbcMarginMB);
-		fbcMarginDevice->setProperty("weg-fbc-margin-status", text);
-		SYSLOG("igfx", "FBC margin lowered to %u MiB", fbcMarginMB);
-	} else {
-		patcher.clearError();
-		fbcMarginDevice->setProperty("weg-fbc-margin-status", "not applied: instruction pattern not found");
-	}
-}
-
 bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	auto cpuGeneration = BaseDeviceInfo::get().cpuGeneration;
 
@@ -604,8 +508,6 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 				SYSLOG("igfx", "FBC timer guard unavailable: unrecognized framebuffer UUID");
 			}
 		}
-		if (fbcMarginDevice && getRealFramebuffer(index) == &kextIntelCFLFb)
-			applyFBCMargin(patcher, index, address, size);
 
 		// Note that the order is reversed at this stage
 		// We first process shared submodules
@@ -620,7 +522,7 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 			if (submodule->enabled)
 				submodule->processFramebufferKext(patcher, index, address, size);
 
-		if (applyFramebufferPatch || dumpFramebufferToDisk || dumpPlatformTable || hdmiAutopatch || powerFlagMask) {
+		if (applyFramebufferPatch || dumpFramebufferToDisk || dumpPlatformTable || hdmiAutopatch || powerFlagMask || reserveFBCMemory) {
 			kblFramebufferLayout = getRealFramebuffer(index) == &kextIntelKBLFb;
 			framebufferStart = reinterpret_cast<uint8_t *>(address);
 			framebufferSize = size;
@@ -1491,12 +1393,15 @@ void IGFX::applyPowerFlags(IOService *controller) {
 			if (frame->framebufferId == UINT32_MAX && frame->pad == 0) {
 				if (match) {
 					uint32_t mask = powerFlagMask;
-					if (mask & (BaseFBCFlag | DynamicFBCFlag)) {
-						// The FAQ's TOTAL STOLEN (the DVMT a platform needs) is the per-framebuffer stolen memory, not
-						// stolen x FBMemoryCount: that product is MAX STOLEN, with every pipe active, and exceeds a
-						// typical 64 MB DVMT on most mobile entries. Add the boot framebuffer memory to stay conservative.
-						uint64_t required = static_cast<uint64_t>(match->fStolenMemorySize) + match->fFramebufferMemorySize;
-						const bool budgetOK = match->fStolenMemorySize && stolenMB && required <= (static_cast<uint64_t>(stolenMB) << 20);
+					if (reserveFBCMemory) {
+						// FBMemMgr_Init (24H232 CFL): the framebuffer memory is one stolen unit with flag 0x2, otherwise
+						// one per framebuffer memory slot. FBC stays on only while unit + fbmem + 1 MiB is below the stolen
+						// pool (DVMT - 4 KiB) minus 8 MiB. The tables run after framebuffer-stolenmem/-fbmem patches.
+						const uint64_t count = match->fFBMemoryCount ? match->fFBMemoryCount : 1;
+						const uint64_t unit = (match->flags.value & 2) ? match->fStolenMemorySize : match->fStolenMemorySize * count;
+						const uint32_t buffer = match->fFramebufferMemorySize ? match->fFramebufferMemorySize : FBCBufferBytes;
+						const uint64_t required = unit + buffer + (9ULL << 20) + 4096;
+						const bool budgetOK = match->fStolenMemorySize && stolenMB && required < (static_cast<uint64_t>(stolenMB) << 20);
 						if (mask & DynamicFBCFlag) {
 							const auto &panel = match->connectors[0];
 							const char *reason = nullptr;
@@ -1515,9 +1420,14 @@ void IGFX::applyPowerFlags(IOService *controller) {
 						}
 						if (!budgetOK)
 							mask &= ~BaseFBCFlag;
+						// The table value (or an explicit framebuffer-fbmem) is kept; only a missing buffer is reserved.
+						const bool wantFBC = ((match->flags.value | mask) & BaseFBCFlag) != 0;
+						if (budgetOK && wantFBC && !match->fFramebufferMemorySize)
+							match->fFramebufferMemorySize = FBCBufferBytes;
 						controller->setProperty("weg-fbc-dvmt-mb", stolenMB, 32);
 						controller->setProperty("weg-fbc-required-mb", static_cast<uint32_t>((required + 0xfffff) >> 20), 32);
 						controller->setProperty("weg-fbc-platform-budget-ok", static_cast<uint32_t>(budgetOK), 32);
+						controller->setProperty("weg-fbc-buffer-mb", budgetOK && wantFBC ? match->fFramebufferMemorySize >> 20 : 0, 32);
 					}
 					uint32_t flags = match->flags.value | mask;
 					if (mask && match->flags.value != flags)
@@ -1570,7 +1480,7 @@ bool IGFX::wrapGetOSInformation(IOService *that) {
 		callbackIGFX->applyWestmereFeaturePatches(that);
 	else if (callbackIGFX->hdmiAutopatch)
 		callbackIGFX->applyHdmiAutopatch();
-	if (callbackIGFX->powerFlagMask)
+	if (callbackIGFX->powerFlagMask || callbackIGFX->reserveFBCMemory)
 		callbackIGFX->applyPowerFlags(that);
 
 #ifdef DEBUG

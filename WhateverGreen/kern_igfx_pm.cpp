@@ -1090,8 +1090,9 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 		auto control = __atomic_load_n(&callbackIGFX->fbcHwControl, __ATOMIC_RELAXED);
 		auto status = __atomic_load_n(&callbackIGFX->fbcHwStatus, __ATOMIC_RELAXED);
 		if (control != UINT32_MAX) {
-			publish("weg-fbc-hw-last-control", control);
-			publish("weg-fbc-hw-last-status2", status);
+			// 64-bit numbers: ioreg shows a 32-bit value with bit 31 set sign-extended
+			igpu->setProperty("weg-fbc-hw-last-control", control, 64);
+			igpu->setProperty("weg-fbc-hw-last-status2", status, 64);
 		}
 		auto pool = __atomic_load_n(&callbackIGFX->fbcMemPool, __ATOMIC_RELAXED);
 		if (pool != UINT32_MAX) {

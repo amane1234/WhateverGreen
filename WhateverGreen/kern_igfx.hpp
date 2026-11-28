@@ -219,14 +219,30 @@ private:
 	void applyPowerFlags(IOService *controller);
 
 	/**
-	 *  Framebuffer list is in Sandy Bridge format
+	 *  igfxpwr=2 also reserves the FBC compressed buffer. The framebuffer controller (24H232 CFL
+	 *  FBMemMgr_Init) sizes it from fFramebufferMemorySize, which is 0 in the CFL/CML tables, and
+	 *  only enables FBC while stolen + fbmem + 1 MiB stays below the stolen pool (DVMT - 4 KiB)
+	 *  minus 8 MiB. With fbmem 0 the hardware compresses into memory the driver does not reserve,
+	 *  which showed as display glitches. 9 MiB covers a 1920x1200 panel at 4 bytes per pixel.
 	 */
-	bool gPlatformListIsSNB {false};
+	static constexpr uint32_t FBCBufferBytes = 9U << 20;
+	bool reserveFBCMemory {false};
 
+	/**
+	 *  -igfxfbctimerguard (24H232 CFL framebuffer only): UpdateFBC can arm the FBC transaction
+	 *  timer through a controller that has no timer object. Skip those calls instead.
+	 */
 	bool guardFBCTimer {false};
 	IORegistryEntry *fbcGuardDevice {nullptr};
 	void (*orgUpdateFBC)(void *, uint32_t) {nullptr};
 	static void wrapUpdateFBC(void *framebuffer, uint32_t event);
+
+	/**
+	 *  Framebuffer list is in Sandy Bridge format
+	 */
+	bool gPlatformListIsSNB {false};
+
+	// -igfxfbctimerguard trace (dynamic-fbc branch, with igfxpwr bit 1)
 	void (*orgWriteFBCControl)(void *, uint32_t) {nullptr};
 	static void wrapWriteFBCControl(void *controller, uint32_t value);
 	mach_vm_address_t fbcTimerCallback {0};
@@ -242,17 +258,6 @@ private:
 	void sampleFBCHardware(void *controller);
 	// 24H232 controller fields read under the trace: stolen pool, per-framebuffer unit, FBC feature flag
 	uint32_t fbcMemPool {UINT32_MAX}, fbcMemUnit {UINT32_MAX}, fbcFeature {UINT32_MAX};
-
-	/**
-	 *  igfxfbcmargin=MiB (24H232 CFL only): FBMemMgr_Init keeps a fixed 8 MiB at the top of the stolen
-	 *  pool free (unit + fbmem + 1 MiB must stay below pool - 8 MiB) and turns FBC off otherwise. The top
-	 *  of stolen memory holds the hardware reserved region (GEN6_STOLEN_RESERVED, 1-8 MiB). The margin is
-	 *  only lowered when that region is at the top and no larger than the requested margin.
-	 */
-	uint32_t fbcMarginMB {0};
-	IORegistryEntry *fbcMarginDevice {nullptr};
-	bool checkFBCMargin();
-	void applyFBCMargin(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 
 	/**
 	 *  IGPU support
