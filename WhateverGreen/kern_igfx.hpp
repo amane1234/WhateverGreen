@@ -333,7 +333,10 @@ private:
 		uint64_t signature {0};
 		bool workaroundsMissing {false};
 	};
-	const char *readFBCState(IOService *controller, FBCCheck &check);
+	const char *readFBCState(IOService *controller, FBCCheck &check, bool native = false);
+	static uint64_t fbcSignature(const FBCCheck &check);
+	// The power generation and surface signature of the last passing check, reused by Apple's FBC enables
+	uint64_t fbcValidEpoch {UINT64_MAX}, fbcValidSignature {0};
 	const char *validateFBC(IOService *controller, FBCCheck &check);
 	const char *validateGTT(IOService *controller, const FBCCheck &check);
 	bool waitFBCDisabled(IOService *controller);

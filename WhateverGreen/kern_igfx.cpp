@@ -470,7 +470,13 @@ constexpr uint32_t SlotTable = 0x37B8, SlotStride = 0x28, CFBSlot = 4;
 constexpr uint64_t MiB = 1ULL << 20;
 }
 
-const char *IGFX::readFBCState(IOService *controller, FBCCheck &c) {
+uint64_t IGFX::fbcSignature(const FBCCheck &c) {
+	// Geometry identity of the surface FBC tracks, without its flipping address
+	return (static_cast<uint64_t>(c.planeCtl & 0x8F001C33) << 32) ^ (static_cast<uint64_t>(c.planeStride) << 16) ^
+		c.planeSize ^ (static_cast<uint64_t>(c.cbBase) << 8) ^ ((c.control >> 6) & 3);
+}
+
+const char *IGFX::readFBCState(IOService *controller, FBCCheck &c, bool native) {
 	auto pci = OSDynamicCast(IOPCIDevice, fbcGuardDevice);
 	if (!pci)
 		return "GPU PCI device unavailable";
@@ -492,12 +498,12 @@ const char *IGFX::readFBCState(IOService *controller, FBCCheck &c) {
 		{ChickenMisc4, &c.misc4}, {StolenReserved, &c.reserved}, {PlaneControl, &c.planeCtl},
 		{PlaneStride, &c.planeStride}, {PlaneSize, &c.planeSize}, {PlaneSurface, &c.planeSurf}
 	};
+	// Inside Apple's own register path the lifecycle gate does not apply (see nativeReadRegister32)
 	for (auto &r : registers)
-		if ((*r.value = readRegister32(controller, r.reg)) == UINT32_MAX && r.reg != ChickenMisc4)
+		if ((*r.value = native ? nativeReadRegister32(controller, r.reg) : readRegister32(controller, r.reg)) == UINT32_MAX &&
+			r.reg != ChickenMisc4)
 			return "display registers unreadable";
-	// Geometry identity of the surface FBC tracks, without its flipping address
-	c.signature = (static_cast<uint64_t>(c.planeCtl & 0x8F001C33) << 32) ^ (static_cast<uint64_t>(c.planeStride) << 16) ^
-		c.planeSize ^ (static_cast<uint64_t>(c.cbBase) << 8) ^ ((c.control >> 6) & 3);
+	c.signature = fbcSignature(c);
 	return nullptr;
 }
 
@@ -613,7 +619,8 @@ const char *IGFX::validateGTT(IOService *controller, const FBCCheck &c) {
 		const uint64_t count = getMember<uint32_t>(controller, entry + 0x20) / 4096;
 		if (getMember<uint32_t>(controller, entry) != 1 || !phys || phys < c.stolenBase || phys >= c.stolenBase + c.stolenSize)
 			continue;
-		for (uint64_t k = 0; k < count && linear; k++)
+		// Every 16th page and the last one keep the check short inside Apple's FBC enable
+		for (uint64_t k = 0; k < count && linear; k = (k + 16 < count || k + 1 == count) ? k + 16 : count - 1)
 			linear = (pte(offset / 4096 + k) & 0x7FFFFFF000ULL) == phys + k * 4096;
 	}
 	// The first check records how the driver maps its stolen framebuffer memory. Only a linear mapping
@@ -665,6 +672,27 @@ void IGFX::setFBCVeto(const char *reason) {
 
 void IGFX::wrapWriteFBCControl(void *controller, uint32_t value) {
 	auto &s = *callbackIGFX;
+	// Check when Apple turns FBC on: dynamic FBC is off most of the time, so the delayed checks can miss it.
+	// Apple's hwFBCSet programs the buffer base and workarounds before this write. A passing result is
+	// reused for the same power generation and surface; reads go straight to Apple's accessor.
+	if ((value & FBCEnable) && !__atomic_load_n(&s.fbcVeto, __ATOMIC_ACQUIRE)) {
+		auto service = static_cast<IOService *>(controller);
+		FBCCheck check;
+		if (!s.readFBCState(service, check, true)) {
+			check.control = value;
+			check.signature = fbcSignature(check);
+			const auto epoch = s.token();
+			if (epoch != __atomic_load_n(&s.fbcValidEpoch, __ATOMIC_ACQUIRE) ||
+				check.signature != __atomic_load_n(&s.fbcValidSignature, __ATOMIC_ACQUIRE)) {
+				const char *reason = s.validateFBC(service, check);
+				if (!reason) {
+					__atomic_store_n(&s.fbcValidSignature, check.signature, __ATOMIC_RELEASE);
+					__atomic_store_n(&s.fbcValidEpoch, epoch, __ATOMIC_RELEASE);
+				}
+				s.setFBCVeto(reason);
+			}
+		}
+	}
 	// While a check failed, Apple's FBC enables become disables, so its +0x38A8 state stays consistent.
 	if (__atomic_load_n(&s.fbcVeto, __ATOMIC_ACQUIRE)) {
 		__atomic_store_n(&s.fbcBlockedControl, value, __ATOMIC_RELEASE);
