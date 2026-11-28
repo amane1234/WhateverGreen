@@ -322,10 +322,12 @@ void WEG::processKernel(KernelPatcher &patcher) {
 	}
 
 	// We need to load vinfo for cleanup and copy.
-	if (resetFramebuffer == FB_COPY || resetFramebuffer == FB_ZEROFILL) {
+	if (resetFramebuffer == FB_COPY || resetFramebuffer == FB_ZEROFILL || igfx.needsFBCGeometry()) {
 		auto info = reinterpret_cast<vc_info *>(patcher.solveSymbol(KernelPatcher::KernelID, "_vinfo"));
 		if (info) {
 			consoleVinfo = *info;
+			if (igfx.needsFBCGeometry())
+				igfx.setFBCGeometry(info->v_width, info->v_height, info->v_rowbytes);
 			DBGLOG("weg", "vinfo 1: %u:%u %u:%u:%u",
 				   consoleVinfo.v_height, consoleVinfo.v_width, consoleVinfo.v_depth, consoleVinfo.v_rowbytes, consoleVinfo.v_type);
 			DBGLOG("weg", "vinfo 2: %s %u:%u %u:%u:%u",

@@ -1254,7 +1254,7 @@ bool BrightnessRequestEventSource::checkForWork() {
 	const bool ready = !smoother->readingPWM;
 	uint32_t current = smoother->initialPWM;
 	IOSimpleLockUnlockEnableInterrupt(smoother->requestLock, irq);
-	if (!request.controller || !ready) {
+	if (!request.controller || !ready || !IGFX::callbackIGFX->admitted() || request.powerToken != IGFX::callbackIGFX->token()) {
 		DBGLOG("igfx", "BLS: [COMM] The request is empty. Will wait for the next invocation.");
 		return false;
 	}
@@ -1345,6 +1345,21 @@ void IGFX::BacklightSmoother::init() {
 	// We need R/W access to MMIO registers
 	requiresMMIORegistersReadAccess = true;
 	requiresMMIORegistersWriteAccess = true;
+}
+
+void IGFX::BacklightSmoother::cancelPowerRequests() {
+	if (!requestLock || !fadeTimer)
+		return;
+	auto irq = IOSimpleLockLockDisableInterrupt(requestLock);
+	++request.id;
+	request.controller = nullptr;
+	readingPWM = false;
+	IOSimpleLockUnlockEnableInterrupt(requestLock, irq);
+	// Serialize cancellation with the worker's final wakeAtTime after a PWM write.
+	workloop->runAction([](OSObject *timer, void *, void *, void *, void *) -> IOReturn {
+		static_cast<IOTimerEventSource *>(timer)->cancelTimeout();
+		return kIOReturnSuccess;
+	}, fadeTimer);
 }
 
 void IGFX::BacklightSmoother::timerFired(OSObject *, IOTimerEventSource *) {
@@ -1500,7 +1515,7 @@ void IGFX::BacklightSmoother::cancelOnPowerOff(void *controller, uint32_t addres
 
 bool IGFX::BacklightSmoother::writeIfCurrent(const BrightnessRequest &active, uint32_t value, bool final) {
 	auto irq = IOSimpleLockLockDisableInterrupt(requestLock);
-	bool current = request.id == active.id && request.controller == active.controller;
+	bool current = callbackIGFX->admitted() && active.powerToken == callbackIGFX->token() && request.id == active.id && request.controller == active.controller;
 	if (current) {
 		callbackIGFX->writeRegister32(active.controller, active.address, value);
 		if (final)
@@ -1513,13 +1528,19 @@ bool IGFX::BacklightSmoother::writeIfCurrent(const BrightnessRequest &active, ui
 void IGFX::BacklightSmoother::submitRequest(void *controller, uint32_t address, uint32_t value, uint32_t mask) {
 	auto &smoother = callbackIGFX->modBacklightSmoother;
 	auto irq = IOSimpleLockLockDisableInterrupt(smoother.requestLock);
+	const auto epoch = callbackIGFX->token();
+	if (!callbackIGFX->admitted()) {
+		IOSimpleLockUnlockEnableInterrupt(smoother.requestLock, irq);
+		return callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32(controller, address, value);
+	}
 	// Coalesce identical pending nonzero requests without restarting the fade.
-	if ((value & mask) && smoother.request.controller == controller && smoother.request.address == address &&
+	if ((value & mask) && smoother.request.powerToken == epoch && smoother.request.controller == controller && smoother.request.address == address &&
 		smoother.request.mask == mask && smoother.request.target == value) {
 		IOSimpleLockUnlockEnableInterrupt(smoother.requestLock, irq);
 		return;
 	}
 	smoother.request = BrightnessRequest(smoother.request.id + 1, controller, address, value, mask);
+	smoother.request.powerToken = epoch;
 	const auto id = smoother.request.id;
 	const bool off = (value & mask) == 0;
 	smoother.readingPWM = !off;

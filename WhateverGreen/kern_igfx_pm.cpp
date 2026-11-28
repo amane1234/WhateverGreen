@@ -296,17 +296,31 @@ void IGFX::RPSControlPatch::deinit() {
 	OSSafeReleaseNULL(igpu);
 }
 
+void IGFX::RPSControlPatch::invalidatePower() {
+	__atomic_fetch_add(&resetGeneration, 1U, __ATOMIC_ACQ_REL);
+	__atomic_fetch_add(&acGeneration, 1U, __ATOMIC_ACQ_REL);
+	__atomic_store_n(&rpCaps, 0U, __ATOMIC_RELEASE);
+	__atomic_store_n(&policyAt, 0ULL, __ATOMIC_RELEASE);
+	__atomic_store_n(&seenDisplay, 0U, __ATOMIC_RELEASE);
+	__atomic_store_n(&lastGTReleaseAck, UINT32_MAX, __ATOMIC_RELEASE);
+	__atomic_store_n(&deferBoostUntil, 0ULL, __ATOMIC_RELEASE);
+	__atomic_store_n(&fastBoostUntil, 0ULL, __ATOMIC_RELEASE);
+}
+
 uint32_t IGFX::RPSControlPatch::readCaps(void *controller) {
-	uint32_t cached = __atomic_load_n(&rpCaps, __ATOMIC_RELAXED);
-	if (cached || !controller || !callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32)
-		return cached;
+	const uint32_t generation = currentGeneration();
+	const auto cached = __atomic_load_n(&rpCaps, __ATOMIC_ACQUIRE);
+	if ((cached >> 32) == generation && static_cast<uint32_t>(cached))
+		return static_cast<uint32_t>(cached);
+	if (!controller || !callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32)
+		return 0;
 	const auto value = callbackIGFX->readRegister32(controller, GEN6_RP_STATE_CAP);
 	const auto rp0 = value & 0xFF;
 	const auto rpn = (value >> 16) & 0xFF;
 	if (value == UINT32_MAX || !rpn || rp0 < rpn || rp0 > (UINT32_MAX >> GEN9_FREQUENCY_SHIFT) / GEN9_FREQ_SCALER)
 		return 0;
-	__atomic_compare_exchange_n(&rpCaps, &cached, value, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
-	return cached ? cached : value;
+	__atomic_store_n(&rpCaps, (static_cast<uint64_t>(generation) << 32) | value, __ATOMIC_RELEASE);
+	return generation == currentGeneration() ? value : 0;
 }
 
 bool IGFX::RPSControlPatch::sustainedSubmissions(uint64_t now) {
@@ -316,6 +330,10 @@ bool IGFX::RPSControlPatch::sustainedSubmissions(uint64_t now) {
 	if (__atomic_exchange_n(&samplingLoad, true, __ATOMIC_ACQUIRE))
 		return false;
 	bool boost = false;
+	if (submissionEpoch != callbackIGFX->token()) {
+		submissionEpoch = callbackIGFX->token();
+		lastNotify = burstStart = 0;
+	}
 	if (now > lastNotify) {
 		if (!lastNotify || now - lastNotify > busyInterval)
 			burstStart = now;
@@ -358,6 +376,8 @@ void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_
 
 		if (!patcher.routeMultiple(index, &routeRequest, 1, address, size)) {
 			SYSLOG(log, "Failed to route pmNotifyWrapper.");
+			patcher.clearError();
+			mode = 0;
 			if (rc6LogCall && !orgPmNotifyWrapper) {
 				thread_call_free(static_cast<thread_call_t>(rc6LogCall));
 				rc6LogCall = nullptr;
@@ -409,7 +429,7 @@ void IGFX::RPSControlPatch::processFramebufferKext(KernelPatcher &patcher, size_
 IOReturn IGFX::RPSControlPatch::wrapDoPMWork(void *controller, uint32_t cmd, void *arg1, void *arg2, void *arg3) {
 	auto &self = callbackIGFX->modRPSControlPatch;
 
-	if ((cmd == PMWORK_GT2_FLOOR || cmd == PMWORK_GT3_FLOOR) && arg1 && self.gtFloorCap) {
+	if (callbackIGFX->admitted() && (cmd == PMWORK_GT2_FLOOR || cmd == PMWORK_GT3_FLOOR) && arg1 && self.gtFloorCap) {
 		uint32_t requested = *static_cast<uint32_t *>(arg1);
 
 		// Never go below the hardware minimum (RPn) or above the maximum (RP0)
@@ -483,6 +503,8 @@ int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1,
 	auto &self = callbackIGFX->modRPSControlPatch;
 
 	int ret = self.orgPmNotifyWrapper(a0, a1, a2, freq);
+	if (!callbackIGFX->admitted())
+		return ret;
 	if (self.rc6Fix || self.diagnostics)
 		self.checkRC6();
 	if (self.mode == 0 || !freq || ret != 0)
@@ -508,15 +530,21 @@ int IGFX::RPSControlPatch::wrapPmNotifyWrapper(unsigned int a0, unsigned int a1,
 		if (__atomic_load_n(&self.acGeneration, __ATOMIC_ACQUIRE) != __atomic_load_n(&self.policyGeneration, __ATOMIC_ACQUIRE) || !sample || now < sample || now - sample > 150 * self.busySamplePeriod ||
 			(self.lastWake && sample < __atomic_load_n(self.lastWake, __ATOMIC_RELAXED)))
 			return ret;
-		auto ceiling = __atomic_load_n(&self.policyLimit, __ATOMIC_RELAXED);
+		auto policy = __atomic_load_n(&self.policyLimit, __ATOMIC_RELAXED);
+		auto ceiling = policy & ~BatteryPolicy;
 		if (tier == 1 && ceiling == 2 && self.deadlineBoost && self.nearVBL(now)) {
 			tier = 2;
 		}
+		const unsigned requestedTier = tier;
 		tier = min(tier, ceiling);
 		if (!tier || !rp0)
 			return ret;
 		if (tier == 1) {
 			auto minRatio = (caps >> 16) & 0xff;
+			// On battery withdraw the supplemental floor as load drops from
+			// tier 2 to tier 1. Sustained high load retains the midrange floor.
+			if ((policy & BatteryPolicy) && requestedTier == 1)
+				return ret;
 			rp0 = minRatio + (rp0 - minRatio) / 2;
 		}
 		// Only ever raise Apple's request
@@ -636,7 +664,7 @@ unsigned IGFX::RPSControlPatch::hardwareBusy(uint64_t now, uint32_t heldMask) {
 				auto end = read(0xa050);
 				result = BusyImplausible;
 				if (end <= 0xffffff && begin >= 128 && end >= begin && busy <= end &&
-					end - begin <= 1 + begin / 50 && stillAwake()) {
+					end - begin <= 1 + begin / 50 && read(0xa024) == ctl && stillAwake()) {
 					result = BusyUnchanged;
 					if (begin != lastWindow || busy != lastBusy) {
 						load = static_cast<uint32_t>(1000ULL * busy / end);
@@ -725,7 +753,7 @@ void IGFX::RPSControlPatch::logRC6(void *param0, void *) {
 		self.logHead = (self.logHead + 1) % arrsize(self.logQueue);
 		--self.logCount;
 		IOSimpleLockUnlockEnableInterrupt(self.logLock, irq);
-		if ((!self.lastWake || event.epoch == __atomic_load_n(self.lastWake, __ATOMIC_RELAXED)) &&
+		if (callbackIGFX->admitted() && (!self.lastWake || event.epoch == __atomic_load_n(self.lastWake, __ATOMIC_RELAXED)) &&
 			event.generation == __atomic_load_n(&self.resetGeneration, __ATOMIC_ACQUIRE))
 			self.reportEvent(event);
 	}
@@ -820,6 +848,11 @@ void IGFX::RPSControlPatch::publishFrequency() {
 void IGFX::RPSControlPatch::sampleVBL() {
 	auto generation = currentGeneration();
 	uint64_t anchor = 0, period = 0;
+	if (discoveryGeneration != generation) {
+		discoveryGeneration = generation;
+		OSSafeReleaseNULL(timingFramebuffer);
+		nextVBLDiscovery = 0;
+	}
 	if (timingFramebuffer && timingFramebuffer->isInactive())
 		OSSafeReleaseNULL(timingFramebuffer);
 	auto now = mach_absolute_time();
@@ -882,7 +915,8 @@ void IGFX::RPSControlPatch::refreshPolicy() {
 				limit = min(1U, limit);
 		}
 	}
-	__atomic_store_n(&policyLimit, limit, __ATOMIC_RELAXED);
+	// Publish the power source with its ceiling as one snapshot.
+	__atomic_store_n(&policyLimit, limit | (ac == 0 ? BatteryPolicy : 0U), __ATOMIC_RELAXED);
 	__atomic_store_n(&policyGeneration, acConsumed, __ATOMIC_RELEASE);
 	__atomic_store_n(&policyAt, mach_absolute_time(), __ATOMIC_RELEASE);
 }
@@ -1020,13 +1054,13 @@ constexpr DisplayObservation displayRegisters[] = {
 };
 }
 
-void IGFX::RPSControlPatch::observeDisplayRead(uint32_t address, uint32_t value) {
+void IGFX::RPSControlPatch::observeDisplayRead(uint32_t address, uint32_t value, uint64_t epoch) {
 	static_assert(arrsize(displayRegisters) == DisplayRegisterCount, "display register cache size");
 	if (value == UINT32_MAX)
 		return;
 	for (unsigned i = 0; i < arrsize(displayRegisters); ++i) {
 		if (address == displayRegisters[i].address) {
-			__atomic_store_n(&displayValues[i], value, __ATOMIC_RELAXED);
+			__atomic_store_n(&displayValues[i], (epoch << 32) | value, __ATOMIC_RELAXED);
 			__atomic_fetch_or(&seenDisplay, 1U << i, __ATOMIC_RELEASE);
 			return;
 		}
@@ -1038,6 +1072,7 @@ void IGFX::RPSControlPatch::sampleEPP() {
 	// Sample the worker CPU. Respect package delegation when its local EPP is not valid.
 	auto irq = IOSimpleLockLockDisableInterrupt(logLock);
 	auto epoch = lastWake ? __atomic_load_n(lastWake, __ATOMIC_RELAXED) : 0;
+	if (callbackIGFX->lifecycle) epoch = callbackIGFX->token();
 	if (readMsr && !readMsr(0x770, &lo, &hi) && (lo & 1) &&
 		!readMsr(0x774, &lo, &hi)) {
 		if (!(hi & (1U << 10)) || (hi & (1U << 28)) || !readMsr(0x772, &lo, &hi))
@@ -1074,8 +1109,13 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 		publish("weg-power-rc6-permille", event.v0);
 	publish("weg-power-window-ms", event.v1);
 	publish("weg-power-uptime-s", event.v2);
+	if (callbackIGFX->lifecycle) {
+		publish("weg-gpu-ready-generation", static_cast<uint32_t>(callbackIGFX->token() >> 3));
+		publish("weg-fbc-surface-valid", static_cast<uint32_t>(__atomic_load_n(&callbackIGFX->surfaceToken, __ATOMIC_ACQUIRE) == callbackIGFX->token() &&
+			__atomic_load_n(&callbackIGFX->surfaceMode, __ATOMIC_ACQUIRE) == __atomic_load_n(&callbackIGFX->modeGeneration, __ATOMIC_ACQUIRE)));
+	}
 	publish("weg-power-status", event.v0 == UINT32_MAX ? "waiting for a valid window" : "sampled");
-	auto wake = lastWake ? __atomic_load_n(lastWake, __ATOMIC_RELAXED) : 0;
+	auto wake = callbackIGFX->lifecycle ? callbackIGFX->token() : lastWake ? __atomic_load_n(lastWake, __ATOMIC_RELAXED) : 0;
 	if (wake != publishedEpoch) {
 		publishedEpoch = wake;
 		lastClock = UINT32_MAX;
@@ -1088,7 +1128,10 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 	const uint32_t seen = __atomic_exchange_n(&seenDisplay, 0U, __ATOMIC_ACQUIRE);
 	for (unsigned i = 0; i < arrsize(displayRegisters); ++i)
 		if (seen & (1U << i)) {
-			auto value = __atomic_load_n(&displayValues[i], __ATOMIC_RELAXED);
+			const auto observation = __atomic_load_n(&displayValues[i], __ATOMIC_ACQUIRE);
+			if (callbackIGFX->lifecycle && static_cast<uint32_t>(observation >> 32) != static_cast<uint32_t>(wake))
+				continue;
+			auto value = static_cast<uint32_t>(observation);
 			publish(displayRegisters[i].property, value);
 			if (displayRegisters[i].address == 0x43208)
 				publish("weg-power-fbc-enabled", value >> 31);
@@ -1108,11 +1151,13 @@ void IGFX::RPSControlPatch::sampleRC6(uint64_t now) {
 	if (diagnostics && now >= nextTelemetry) {
 		nextTelemetry = now + telemetryInterval;
 		auto epoch = lastWake ? __atomic_load_n(lastWake, __ATOMIC_RELAXED) : 0;
+		if (callbackIGFX->lifecycle) epoch = callbackIGFX->token();
 		if (epoch != telemetryEpoch) {
 			telemetryEpoch = epoch;
 			__atomic_store_n(&lastGTReleaseAck, UINT32_MAX, __ATOMIC_RELAXED);
 			sampleTime = sampleWall = 0;
-			__atomic_store_n(&seenDisplay, 0U, __ATOMIC_RELEASE);
+			if (!callbackIGFX->lifecycle)
+				__atomic_store_n(&seenDisplay, 0U, __ATOMIC_RELEASE);
 			__atomic_store_n(&deferBoostUntil, 0ULL, __ATOMIC_RELAXED);
 			__atomic_store_n(&fastBoostUntil, 0ULL, __ATOMIC_RELAXED);
 		}
@@ -1190,9 +1235,9 @@ bool IGFX::RPSControlPatch::patchRCSCheck(mach_vm_address_t& start) {
 
 // MARK: - Force Wake Workaround
 
-static uint64_t forceWakeDeadline() {
+static uint64_t forceWakeDeadline(uint32_t milliseconds = FORCEWAKE_ACK_TIMEOUT_MS) {
 	uint64_t deadline;
-	clock_interval_to_deadline(FORCEWAKE_ACK_TIMEOUT_MS, kMillisecondScale, &deadline);
+	clock_interval_to_deadline(milliseconds, kMillisecondScale, &deadline);
 	return deadline;
 }
 
@@ -1200,7 +1245,7 @@ static uint64_t forceWakeDeadline() {
 // sleep here. Space out slow MMIO reads while keeping the common ACK fast.
 bool IGFX::ForceWakeWorkaround::pollRegister(void *controller, uint32_t reg, uint32_t val, uint32_t mask, uint64_t deadline) {
 	unsigned delay = 0;
-	do {
+	while (mach_absolute_time() < deadline && callbackIGFX->admitted()) {
 		auto rd = callbackIGFX->readRegister32(controller, reg);
 		if (rd == UINT32_MAX)
 			return false;
@@ -1209,16 +1254,15 @@ bool IGFX::ForceWakeWorkaround::pollRegister(void *controller, uint32_t reg, uin
 		if (delay)
 			IODelay(delay);
 		delay = delay ? min(16U, delay * 2) : 1;
-	} while (mach_absolute_time() < deadline);
+	}
 	return false;
 }
 
-bool IGFX::ForceWakeWorkaround::forceWakeWaitAckFallback(void *controller, uint32_t d, uint32_t val, uint32_t mask) {
+bool IGFX::ForceWakeWorkaround::forceWakeWaitAckFallback(void *controller, uint32_t d, uint32_t val, uint32_t mask, uint64_t deadline) {
 	auto &self = callbackIGFX->modForceWakeWorkaround;
 	// All contexts share bit 15 on a domain. Never clear another caller's pulse.
 	if (__atomic_fetch_or(&self.fallbackDomains, d, __ATOMIC_ACQUIRE) & d)
 		return false;
-	const auto deadline = forceWakeDeadline();
 	bool ack = false;
 	for (unsigned pass = 1; pass <= 10 && mach_absolute_time() < deadline; ++pass) {
 		if (!pollRegister(controller, ackForDom(d), 0, FORCEWAKE_KERNEL_FALLBACK, deadline))
@@ -1237,9 +1281,9 @@ bool IGFX::ForceWakeWorkaround::forceWakeWaitAckFallback(void *controller, uint3
 }
 
 void IGFX::RPSControlPatch::wakeRequest(bool set, uint32_t domains, uint32_t context) {
-	if (set || !(domains & DOM_BLITTER) || context >= 15)
+	if (!callbackIGFX->admitted() || !(domains & DOM_BLITTER) || context >= 15)
 		return;
-	if (observe && callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32) {
+	if (!set && observe && callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32) {
 		auto controller = callbackIGFX->defaultController();
 		if (controller)
 			__atomic_store_n(&lastGTReleaseAck, callbackIGFX->readRegister32(controller, FORCEWAKE_ACK_BLITTER_GEN9), __ATOMIC_RELAXED);
@@ -1250,37 +1294,55 @@ void IGFX::RPSControlPatch::wakeRequest(bool set, uint32_t domains, uint32_t con
 
 void IGFX::RPSControlPatch::observeWake(void *accelerator, bool set, uint32_t domains, uint32_t context) {
 	auto &self = callbackIGFX->modRPSControlPatch;
-	self.wakeRequest(set, domains, context);
+	if (!set)
+		self.wakeRequest(false, domains, context);
 	self.orgObservedWake(accelerator, set, domains, context);
+	if (set)
+		self.wakeRequest(true, domains, context);
 }
 
 void IGFX::ForceWakeWorkaround::forceWake(void *accelerator, bool set, uint32_t dom, uint32_t ctx) {
 	auto &self = callbackIGFX->modForceWakeWorkaround;
-	if (callbackIGFX->modRPSControlPatch.wantsWakeHook())
-		callbackIGFX->modRPSControlPatch.wakeRequest(set, dom, ctx);
+	if (!callbackIGFX->admitted())
+		return self.orgForceWake(accelerator, set, dom, ctx);
+	auto &rps = callbackIGFX->modRPSControlPatch;
+	if (!set && rps.wantsWakeHook())
+		rps.wakeRequest(false, dom, ctx);
 	auto controller = callbackIGFX->defaultController();
 	if (!controller || !callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32 ||
 		!callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32 ||
 		ctx >= 15 || (dom & ~(DOM_RENDER | DOM_MEDIA | DOM_BLITTER))) {
 		self.orgForceWake(accelerator, set, dom, ctx);
+		if (set && rps.wantsWakeHook())
+			rps.wakeRequest(true, dom, ctx);
 		return;
 	}
 
 	const uint32_t mask = 1U << ctx;
 	const uint32_t expected = set ? mask : 0;
+	const auto deadline = forceWakeDeadline();
+	const auto epoch = callbackIGFX->token();
 	for (unsigned d = DOM_FIRST; d <= DOM_LAST; d <<= 1) {
 		if (!(dom & d))
 			continue;
+		if (mach_absolute_time() >= deadline || !callbackIGFX->beginAccess(controller, epoch)) {
+			self.orgForceWake(accelerator, set, dom & ~(d - 1U), ctx);
+			break;
+		}
 		callbackIGFX->writeRegister32(controller, regForDom(d), masked_field(mask, expected));
 		IOPause(100);
-		if (!pollRegister(controller, ackForDom(d), expected, mask, forceWakeDeadline()) &&
-			!forceWakeWaitAckFallback(controller, d, expected, mask) &&
-			!pollRegister(controller, ackForDom(d), expected, mask, forceWakeDeadline())) {
+		const bool failed = !pollRegister(controller, ackForDom(d), expected, mask, min(deadline, forceWakeDeadline(1))) &&
+			!forceWakeWaitAckFallback(controller, d, expected, mask, deadline) &&
+			!pollRegister(controller, ackForDom(d), expected, mask, deadline);
+		callbackIGFX->endAccess();
+		if (failed) {
 			// The ABI has no error return. Hand the unresolved request to
 			// Apple's original routine, with its own recovery/failure policy.
 			self.orgForceWake(accelerator, set, d, ctx);
 		}
 	}
+	if (set && rps.wantsWakeHook())
+		rps.wakeRequest(true, dom, ctx);
 }
 
 void IGFX::ForceWakeWorkaround::init() {

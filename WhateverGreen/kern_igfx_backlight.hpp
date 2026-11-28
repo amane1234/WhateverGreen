@@ -58,6 +58,7 @@ struct BrightnessRequest {
 	 * The request ID to check if the request was changed
 	 */
 	uint64_t id {0};
+	uint64_t powerToken {0};
 	
 	/**
 	 *  Create an empty request

@@ -20,6 +20,9 @@
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOTimerEventSource.h>
 
+class IOFramebuffer;
+struct IOPixelInformation;
+
 class IGFX {
 public:
 	void init();
@@ -32,6 +35,8 @@ public:
 	 *  @param info     device info
 	 */
 	void processKernel(KernelPatcher &patcher, DeviceInfo *info);
+	bool needsFBCGeometry() const { return reserveFBCMemory; }
+	void setFBCGeometry(uint32_t width, uint32_t height, uint32_t stride);
 
 	/**
 	 *  Patch kext if needed and prepare other patches
@@ -226,15 +231,59 @@ private:
 	 */
 	static constexpr uint32_t FBCBufferBytes = 9U << 20;
 	bool reserveFBCMemory {false};
+	uint64_t fbcSurfaceBytes {0};
 
 	/**
 	 *  -igfxfbctimerguard (24H232 CFL framebuffer only): UpdateFBC can arm the FBC transaction
 	 *  timer through a controller that has no timer object. Skip those calls instead.
 	 */
 	bool guardFBCTimer {false};
+	// Low bits hold the phase. Every transition gets a new token, so an
+	// observation or a returning PM call cannot reopen a later generation.
+	enum GPUPhase : uint64_t { Closed, Transition, Off, AwaitClock, Ready };
+	bool lifecycle {false};
+	uint64_t powerToken {Closed}, surfaceToken {UINT64_MAX};
+	void *powerController {nullptr};
+	uint32_t surfaceReservation {0};
+	uint64_t timerEpoch {UINT64_MAX};
+	void *armedTimer {nullptr};
+	const uint64_t *systemWake {nullptr};
+	uint64_t readyWake {0};
+	uint64_t token() const { return __atomic_load_n(&powerToken, __ATOMIC_ACQUIRE); }
+	bool wakeCurrent() const {
+		return systemWake && __atomic_load_n(systemWake, __ATOMIC_ACQUIRE) == __atomic_load_n(&readyWake, __ATOMIC_ACQUIRE);
+	}
+	bool admitted() const { return !lifecycle || ((token() & 7) == Ready && wakeCurrent()); }
+	IOReturn (*orgControllerPower)(IOService *, unsigned long, IOService *) {nullptr};
+	static IOReturn wrapControllerPower(IOService *, unsigned long, IOService *);
+	IOReturn (*orgPixels)(IOFramebuffer *, int, int, int, IOPixelInformation *) {nullptr};
+	static IOReturn wrapPixels(IOFramebuffer *, int, int, int, IOPixelInformation *);
+	IOReturn (*orgMode)(IOFramebuffer *, int, int) {nullptr};
+	static IOReturn wrapMode(IOFramebuffer *, int, int);
+	uint64_t modeGeneration {0}, surfaceMode {UINT64_MAX};
+	uint32_t activeAccesses {0};
+	bool beginAccess(void *controller, uint64_t epoch) {
+		if (!lifecycle)
+			return true;
+		if ((epoch & 7) != Ready || !wakeCurrent() || controller != __atomic_load_n(&powerController, __ATOMIC_ACQUIRE))
+			return false;
+		__atomic_fetch_add(&activeAccesses, 1U, __ATOMIC_SEQ_CST);
+		if (__atomic_load_n(&powerToken, __ATOMIC_SEQ_CST) == epoch)
+			return true;
+		endAccess();
+		return false;
+	}
+	void endAccess() {
+		if (lifecycle)
+			__atomic_fetch_sub(&activeAccesses, 1U, __ATOMIC_SEQ_CST);
+	}
+	bool fbcReady(void *controller) const;
+	void installLifecycle(KernelPatcher &, size_t, mach_vm_address_t, size_t);
 	IORegistryEntry *fbcGuardDevice {nullptr};
 	void (*orgUpdateFBC)(void *, uint32_t) {nullptr};
 	static void wrapUpdateFBC(void *framebuffer, uint32_t event);
+	void (*orgFBCTimerFired)(IOService *) {nullptr};
+	static void wrapFBCTimerFired(IOService *controller);
 
 	/**
 	 *  Framebuffer list is in Sandy Bridge format
@@ -747,7 +796,14 @@ private:
 	 *  @return The register value.
 	 */
 	uint32_t readRegister32(void *controller, uint32_t address) {
-		return modMMIORegistersReadSupport.orgReadRegister32(controller, address);
+		if (!lifecycle)
+			return modMMIORegistersReadSupport.orgReadRegister32(controller, address);
+		const auto epoch = __atomic_load_n(&powerToken, __ATOMIC_SEQ_CST);
+		if (!beginAccess(controller, epoch))
+			return UINT32_MAX;
+		const auto result = modMMIORegistersReadSupport.orgReadRegister32(controller, address);
+		endAccess();
+		return result;
 	}
 	
 	/**
@@ -1315,7 +1371,7 @@ private:
 	 */
 	class RPSControlPatch: public PatchSubmodule {
 		// The fused RP limits belong to the built-in GPU and survive power transitions.
-		uint32_t rpCaps {0};
+		uint64_t rpCaps {0};
 		uint32_t readCaps(void *controller);
 		bool sustainedSubmissions(uint64_t now);
 		bool samplingLoad {false};
@@ -1345,9 +1401,10 @@ private:
 		void trackCounter(uint32_t ticks, uint64_t now);
 		unsigned hardwareBusy(uint64_t now, uint32_t heldMask = 0);
 		bool measurementStarted {false};
+		uint64_t submissionEpoch {0};
 		uint64_t lastHeldSample {0}, nextVBLRefresh {0}, nextVBLDiscovery {0};
 		IOService *timingFramebuffer {nullptr};
-		uint32_t vblGeneration {0};
+		uint32_t vblGeneration {0}, discoveryGeneration {UINT32_MAX};
 		bool frequencyProfile {false}, recordingFrequency {false};
 		uint32_t previousBand {32}, frequencyGeneration {0};
 		uint64_t previousFrequencyAt {0}, frequencyBins[32] {}, frequencyWindow {0};
@@ -1372,6 +1429,7 @@ private:
 		int acState {-1};
 		uint64_t acCheckedAt {0}, acCheckInterval {0}, acEpoch {0};
 		// 0 native, 1 middle tier, 2 maximum. Updated by the reporting worker.
+		static constexpr unsigned BatteryPolicy = 1U << 8;
 		uint32_t policyLimit {0}, measuredTier {0};
 		uint64_t policyAt {0}, previousBusySample {0};
 		int (*thermalMsr)(uint32_t, uint32_t *, uint32_t *) {nullptr};
@@ -1392,13 +1450,13 @@ private:
 		void publishTelemetry(const Event &event);
 		void sampleEPP();
 		enum { DisplayRegisterCount = 8 };
-		uint32_t displayValues[DisplayRegisterCount] {};
+		uint64_t displayValues[DisplayRegisterCount] {};
 		uint32_t seenDisplay {0};
 		const uint64_t *lastWake {nullptr};
 		uint64_t telemetryEpoch {0}, publishedEpoch {0}, eppEpoch {0};
 		bool currentEPP() const {
-			return !lastWake || __atomic_load_n(lastWake, __ATOMIC_RELAXED) ==
-				__atomic_load_n(&eppEpoch, __ATOMIC_ACQUIRE);
+			return callbackIGFX->lifecycle ? callbackIGFX->token() == __atomic_load_n(&eppEpoch, __ATOMIC_ACQUIRE) :
+				!lastWake || __atomic_load_n(lastWake, __ATOMIC_RELAXED) == __atomic_load_n(&eppEpoch, __ATOMIC_ACQUIRE);
 		}
 		uint32_t lastClock {UINT32_MAX};
 		// igfxpwr=8: while the CPU's HWP EPP prefers performance, boost after one busy interval
@@ -1459,8 +1517,9 @@ private:
 		 *  True if this fix is available for the current Intel platform
 		 */
 		bool available {false};
-		void observeDisplayRead(uint32_t address, uint32_t value);
+		void observeDisplayRead(uint32_t address, uint32_t value, uint64_t epoch);
 		uint32_t currentGeneration() const { return __atomic_load_n(&resetGeneration, __ATOMIC_ACQUIRE); }
+		void invalidatePower();
 		void observedReset() {
 			__atomic_fetch_add(&resetRequests, 1U, __ATOMIC_RELAXED);
 			__atomic_fetch_add(&resetGeneration, 1U, __ATOMIC_ACQ_REL);
@@ -1491,7 +1550,7 @@ private:
 		void (*orgForceWake)(void *, bool, uint32_t, uint32_t) {nullptr};
 		uint32_t fallbackDomains {0};
 		static bool pollRegister(void *controller, uint32_t reg, uint32_t val, uint32_t mask, uint64_t deadline);
-		static bool forceWakeWaitAckFallback(void *controller, uint32_t domain, uint32_t val, uint32_t mask);
+		static bool forceWakeWaitAckFallback(void *controller, uint32_t domain, uint32_t val, uint32_t mask, uint64_t deadline);
 		static void forceWake(void *, bool set, uint32_t dom, uint32_t);
 		
 	public:
@@ -2375,6 +2434,8 @@ private:
 		 *  Brightness request event source needs access to the queue and config parameters
 		 */
 		friend class BrightnessRequestEventSource;
+		friend class IGFX;
+		void cancelPowerRequests();
 
 		/**
 		 *  Default number of steps to reach the target duty value

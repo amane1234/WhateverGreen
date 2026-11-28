@@ -17,6 +17,7 @@
 #include <Headers/kern_iokit.hpp>
 
 #include <IOKit/pci/IOPCIDevice.h>
+#include <IOKit/graphics/IOFramebuffer.h>
 
 IGFX *IGFX::callbackIGFX;
 
@@ -176,7 +177,8 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	if (info->videoBuiltin && !gPlatformGraphicsSupported) {
 		switchOffGraphics = switchOffFramebuffer = true;
 	} else if (info->videoBuiltin) {
-		guardFBCTimer = checkKernelArgument("-igfxfbctimerguard");
+		lifecycle = checkKernelArgument("-igfxpmlifecycle");
+		guardFBCTimer = lifecycle || checkKernelArgument("-igfxfbctimerguard");
 		if (guardFBCTimer && !fbcGuardDevice) {
 			fbcGuardDevice = info->videoBuiltin;
 			fbcGuardDevice->retain();
@@ -354,14 +356,146 @@ static bool matchesFBCTimerLayout(mach_vm_address_t address, size_t size) {
 	return false;
 }
 
+void IGFX::installLifecycle(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	systemWake = reinterpret_cast<const uint64_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_gIOLastWakeAbsTime"));
+	if (!systemWake)
+		patcher.clearError();
+	if (!systemWake || !matchesFBCTimerLayout(address, size) || !orgUpdateFBC || !orgFBCTimerFired ||
+		!modMMIORegistersReadSupport.orgReadRegister32) {
+		fbcGuardDevice->setProperty("weg-gpu-lifecycle", "disabled: missing prerequisite");
+		return;
+	}
+	KernelPatcher::RouteRequest hooks[] {
+		{"__ZN21AppleIntelFramebuffer19getPixelInformationEiiiP18IOPixelInformation", wrapPixels, orgPixels},
+		{"__ZN21AppleIntelFramebuffer14setDisplayModeEii", wrapMode, orgMode},
+		{"__ZN31AppleIntelFramebufferController13setPowerStateEmP9IOService", wrapControllerPower, orgControllerPower}
+	};
+	if (!patcher.routeMultiple(index, hooks, arrsize(hooks), address, size)) {
+		patcher.clearError();
+		fbcGuardDevice->setProperty("weg-gpu-lifecycle", "disabled: incomplete hooks");
+		return;
+	}
+	__atomic_store_n(&powerToken, static_cast<uint64_t>(AwaitClock), __ATOMIC_RELEASE);
+	fbcGuardDevice->setProperty("weg-gpu-lifecycle", "installed");
+}
+
+IOReturn IGFX::wrapControllerPower(IOService *controller, unsigned long state, IOService *device) {
+	auto &s = *callbackIGFX;
+	auto old = s.token();
+	if ((old & 7) == Closed)
+		return s.orgControllerPower(controller, state, device);
+	void *owner = nullptr;
+	if (!__atomic_compare_exchange_n(&s.powerController, &owner, static_cast<void *>(controller), false,
+		__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && owner != controller)
+		return s.orgControllerPower(controller, state, device);
+	uint64_t transition;
+	do {
+		transition = ((old & ~7ULL) + 8) | Transition;
+	} while (!__atomic_compare_exchange_n(&s.powerToken, &old, transition, false, __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE));
+	// Drain bounded register accesses and ForceWake pulses before Apple powers down.
+	while (__atomic_load_n(&s.activeAccesses, __ATOMIC_SEQ_CST))
+		IOSleep(1);
+	s.modBacklightSmoother.cancelPowerRequests();
+	s.modRPSControlPatch.invalidatePower();
+	if (s.fbcGuardDevice)
+		s.fbcGuardDevice->setProperty("weg-gpu-power-generation", transition >> 3, 64);
+	auto result = s.orgControllerPower(controller, state, device);
+	// CFL 24H232 performs its power-up path at ordinal 2 and acknowledges synchronously.
+	auto next = (transition & ~7ULL) | (state == 2 && !result ? AwaitClock : Off);
+	__atomic_compare_exchange_n(&s.powerToken, &transition, next, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+	return result;
+}
+
+IOReturn IGFX::wrapPixels(IOFramebuffer *fb, int mode, int depth, int aperture, IOPixelInformation *pixels) {
+	auto &s = *callbackIGFX;
+	auto epoch = s.token();
+	auto serial = __atomic_load_n(&s.modeGeneration, __ATOMIC_ACQUIRE);
+	auto result = s.orgPixels(fb, mode, depth, aperture, pixels);
+	uint32_t index;
+	if ((epoch & 7) != Ready || aperture != kIOFBSystemAperture || !AppleIntelFramebufferExplorer::getIndex(fb, index) || index ||
+		getMember<void *>(fb, 0x1D0) != __atomic_load_n(&s.powerController, __ATOMIC_ACQUIRE))
+		return result;
+	// 24H232 getCurrentDisplayMode returns these two fields. A nested
+	// getCurrentDisplayMode here could call back into display enumeration.
+	if (!getMember<uint8_t>(fb, 0x1E0) || mode != getMember<int>(fb, 0xA1C0) || depth != getMember<int>(fb, 0xA1C4))
+		return result;
+	auto controller = getMember<void *>(fb, 0x1D0);
+	auto platform = getMember<void *>(controller, 0x1C70);
+	const uint32_t pool = getMember<uint32_t>(controller, 0x2C48);
+	const uint32_t unit = getMember<uint32_t>(controller, 0x2C4C);
+	const uint32_t count = getMember<uint8_t>(controller, 0x2C59);
+	const uint32_t flags = platform ? getMember<uint32_t>(platform, 0x58) : 0;
+	const uint32_t reserved = getMember<uint8_t>(controller, 0x38A2) == 1 ?
+		getMember<uint32_t>(controller, 0x38A4) : (flags & 4U) ? getMember<uint32_t>(platform, 0x18) : 0;
+	const uint64_t required = static_cast<uint64_t>(unit) * ((flags & 2U) ? 1 : count) + reserved + (9ULL << 20);
+	bool fits = count && unit && reserved && required < pool &&
+		reserved >= __atomic_load_n(&s.surfaceReservation, __ATOMIC_ACQUIRE) && !result && pixels && pixels->activeWidth && pixels->activeHeight && pixels->bytesPerRow &&
+		pixels->bitsPerPixel && static_cast<uint64_t>(pixels->activeWidth) * pixels->bitsPerPixel <= 8ULL * pixels->bytesPerRow &&
+		static_cast<uint64_t>(pixels->bytesPerRow) * pixels->activeHeight <= reserved;
+	__atomic_store_n(&s.surfaceMode, serial, __ATOMIC_RELEASE);
+	__atomic_store_n(&s.surfaceToken, fits ? epoch : UINT64_MAX, __ATOMIC_RELEASE);
+	return result;
+}
+
+IOReturn IGFX::wrapMode(IOFramebuffer *fb, int mode, int depth) {
+	auto &s = *callbackIGFX;
+	uint32_t index;
+	if (!AppleIntelFramebufferExplorer::getIndex(fb, index) || index)
+		return s.orgMode(fb, mode, depth);
+	__atomic_fetch_add(&s.modeGeneration, 1ULL, __ATOMIC_ACQ_REL);
+	auto result = s.orgMode(fb, mode, depth);
+	__atomic_fetch_add(&s.modeGeneration, 1ULL, __ATOMIC_ACQ_REL);
+	if (!result && s.admitted()) {
+		IOPixelInformation pixels {};
+		fb->getPixelInformation(mode, depth, kIOFBSystemAperture, &pixels);
+	}
+	return result;
+}
+
+bool IGFX::fbcReady(void *controller) const {
+	if (!lifecycle)
+		return true;
+	auto epoch = token();
+	auto mode = __atomic_load_n(&modeGeneration, __ATOMIC_ACQUIRE);
+	return controller && admitted() && (epoch & 7) == Ready && !(mode & 1) && controller == __atomic_load_n(&powerController, __ATOMIC_ACQUIRE) &&
+		__atomic_load_n(&surfaceToken, __ATOMIC_ACQUIRE) == epoch &&
+		__atomic_load_n(&surfaceMode, __ATOMIC_ACQUIRE) == mode && getMember<uint8_t>(controller, 0x38A0);
+}
+
+void IGFX::wrapFBCTimerFired(IOService *controller) {
+	if (callbackIGFX->lifecycle && getMember<uint32_t>(controller, 0x38AC) != 0xFFFF &&
+		(getMember<uint32_t>(controller, 0x38AC) != 0 ||
+		 __atomic_load_n(&callbackIGFX->armedTimer, __ATOMIC_ACQUIRE) != getMember<void *>(controller, 0x1B60) ||
+		 __atomic_load_n(&callbackIGFX->timerEpoch, __ATOMIC_ACQUIRE) != callbackIGFX->token()))
+		return;
+	// 24H232 may rearm the timer from the callback itself. Read the current
+	// controller fields on each invocation, including the first one after wake.
+	if (getMember<uint32_t>(controller, 0x38AC) != 0xFFFF &&
+		(!callbackIGFX->fbcReady(controller) || controller->isInactive() || !getMember<void *>(controller, 0x1B60) || !getMember<void *>(controller, 0x2C00)))
+		return;
+	callbackIGFX->orgFBCTimerFired(controller);
+}
+
 void IGFX::wrapUpdateFBC(void *framebuffer, uint32_t event) {
+	const auto epoch = callbackIGFX->token();
 	auto controller = getMember<void *>(framebuffer, 0x1D0);
 	if (!controller)
 		return;
 	// Events 1 and 4 can arm the transaction timer. Other events may cancel
 	// it when a transition is pending. Preserve native idle cleanup otherwise.
+	if ((event == 1 || event == 4) && (!callbackIGFX->fbcReady(controller) || static_cast<IOService *>(controller)->isInactive() || !getMember<uint8_t>(controller, 0x38A0)))
+		return;
 	if ((event == 1 || event == 4 || getMember<uint8_t>(controller, 0x1B68) == 1) && !getMember<void *>(controller, 0x1B60))
 		return;
+	if (callbackIGFX->lifecycle && (event == 1 || event == 4)) {
+		auto slots = getMember<void **>(controller, 0x2C00);
+		if (!slots || slots[0] != framebuffer)
+			return;
+		if (!getMember<uint8_t>(controller, 0x1B68)) {
+			__atomic_store_n(&callbackIGFX->armedTimer, getMember<void *>(controller, 0x1B60), __ATOMIC_RELEASE);
+			__atomic_store_n(&callbackIGFX->timerEpoch, epoch, __ATOMIC_RELEASE);
+		}
+	}
 	callbackIGFX->orgUpdateFBC(framebuffer, event);
 }
 
@@ -417,6 +551,12 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 			if (matchesFBCTimerLayout(address, size)) {
 				KernelPatcher::RouteRequest route("__ZN21AppleIntelFramebuffer9UpdateFBCEj", wrapUpdateFBC, orgUpdateFBC);
 				if (patcher.routeMultiple(index, &route, 1, address, size)) {
+					KernelPatcher::RouteRequest fired("__ZN31AppleIntelFramebufferController26TransactionCountTimerFiredEv",
+						wrapFBCTimerFired, orgFBCTimerFired);
+					bool guarded = patcher.routeMultiple(index, &fired, 1, address, size);
+					if (!guarded)
+						patcher.clearError();
+					fbcGuardDevice->setProperty("weg-fbc-timer-callback-guard", guarded ? "installed" : "route failed");
 					fbcGuardDevice->setProperty("weg-fbc-timer-guard", "installed");
 					SYSLOG("igfx", "FBC timer guard installed");
 				} else {
@@ -438,6 +578,9 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 			if (submodule->enabled)
 				submodule->processFramebufferKext(patcher, index, address, size);
 		
+		if (lifecycle && getRealFramebuffer(index) == &kextIntelCFLFb)
+			installLifecycle(patcher, index, address, size);
+
 		// Then iterate through each submodule and redirect the request if and only if it is enabled
 		for (auto submodule : submodules)
 			if (submodule->enabled)
@@ -533,9 +676,8 @@ void IGFX::MMIORegistersReadSupport::init() {
 void IGFX::MMIORegistersReadSupport::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	// Enable the verbose output if the boot argument is found
 	verbose = checkKernelArgument("-igfxvamregs");
-	enabled |= verbose;
+	enabled |= verbose || callbackIGFX->lifecycle;
 	
-	// Enable if at least one active submodule relies on this shared module
 	for (auto submodule : callbackIGFX->submodules)
 		if (submodule->enabled)
 			enabled |= submodule->requiresMMIORegistersReadAccess;
@@ -583,6 +725,31 @@ void IGFX::MMIORegistersReadSupport::disableDependentSubmodules() {
 }
 
 uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, uint32_t address) {
+	auto &s = *callbackIGFX;
+	auto epoch = s.token();
+	if (s.lifecycle && (epoch & 7) == Ready && !s.wakeCurrent()) {
+		// A restore can change the kernel wake stamp after controller PM returned.
+		// Invalidate producer generations without sleeping in the MMIO hook.
+		auto closed = ((epoch & ~7ULL) + 8) | Transition;
+		if (__atomic_compare_exchange_n(&s.powerToken, &epoch, closed, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+			s.modRPSControlPatch.invalidatePower();
+			__atomic_compare_exchange_n(&s.powerToken, &closed, (closed & ~7ULL) | AwaitClock, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+		}
+		epoch = s.token();
+	}
+	if (s.lifecycle && (epoch & 7) != Ready) {
+		auto wake = s.systemWake ? __atomic_load_n(s.systemWake, __ATOMIC_ACQUIRE) : 0;
+		auto value = s.modMMIORegistersReadSupport.orgReadRegister32(controller, address);
+		if ((epoch & 7) == AwaitClock && address == 0x46000 && value != UINT32_MAX && (value & 0x7ff)) {
+			void *owner = nullptr;
+			if (__atomic_compare_exchange_n(&s.powerController, &owner, controller, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || owner == controller) {
+				__atomic_store_n(&s.readyWake, wake, __ATOMIC_RELEASE);
+				if (__atomic_compare_exchange_n(&s.powerToken, &epoch, (epoch & ~7ULL) | Ready, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+					s.modRPSControlPatch.observeDisplayRead(address, value, (epoch & ~7ULL) | Ready);
+			}
+		}
+		return value;
+	}
 	// Guard: Perform prologue injections
 	auto prologueInjector = callbackIGFX->modMMIORegistersReadSupport.prologueList.getInjector(address);
 	if (prologueInjector) {
@@ -600,6 +767,8 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 	// Invoke the original function
 	auto generation = (address == 0xA090 || address == 0xA01C) ? callbackIGFX->modRPSControlPatch.currentGeneration() : 0;
 	uint32_t retVal = callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32(controller, address);
+	if (s.lifecycle && s.token() != epoch)
+		return retVal;
 	switch (address) {
 		case 0xA01C:
 			callbackIGFX->modRPSControlPatch.observeFrequency(retVal, generation);
@@ -610,7 +779,7 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 		case 0x6F840: case 0x6F940: case 0x45504: case 0x80030:
 		case 0x8002C: case 0x43208: case 0x43214: case 0x46000:
 			if (callbackIGFX->powerOptions & (Diagnose | RequestDynamicFBC))
-				callbackIGFX->modRPSControlPatch.observeDisplayRead(address, retVal);
+				callbackIGFX->modRPSControlPatch.observeDisplayRead(address, retVal, epoch);
 			break;
 	}
 	if (callbackIGFX->modMMIORegistersReadSupport.verbose)
@@ -687,6 +856,8 @@ void IGFX::MMIORegistersWriteSupport::disableDependentSubmodules() {
 }
 
 void IGFX::MMIORegistersWriteSupport::wrapWriteRegister32(void *controller, uint32_t address, uint32_t value) {
+	if (!callbackIGFX->admitted())
+		return callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32(controller, address, value);
 	// Guard: Perform prologue injections
 	auto prologueInjector = callbackIGFX->modMMIORegistersWriteSupport.prologueList.getInjector(address);
 	if (prologueInjector) {
@@ -1300,6 +1471,14 @@ bool IGFX::wrapAcceleratorStart(IOService *that, IOService *provider) {
 	return ret;
 }
 
+void IGFX::setFBCGeometry(uint32_t width, uint32_t height, uint32_t stride) {
+	// The boot console can use a lower depth than the accelerated scanout.
+	if (width && height && stride) {
+		const uint64_t pitch = max(static_cast<uint64_t>(stride), static_cast<uint64_t>(width) * 4);
+		fbcSurfaceBytes = pitch > UINT32_MAX ? UINT64_MAX : pitch * height;
+	}
+}
+
 void IGFX::applyPowerFlags(IOService *controller) {
 	auto table = reinterpret_cast<uintptr_t>(gPlatformInformationList);
 	auto start = reinterpret_cast<uintptr_t>(framebufferStart);
@@ -1321,17 +1500,26 @@ void IGFX::applyPowerFlags(IOService *controller) {
 						const bool wantFBC = ((match->flags.value | mask) & 4) != 0;
 						const uint64_t count = match->fFBMemoryCount ? match->fFBMemoryCount : 1;
 						const uint64_t unit = (match->flags.value & 2) ? match->fStolenMemorySize : match->fStolenMemorySize * count;
-						const uint32_t buffer = match->fFramebufferMemorySize ? match->fFramebufferMemorySize : FBCBufferBytes;
+						// The boot mode is a lower bound. Keep the existing 9 MiB fallback for
+						// smaller boot consoles; explicit/native reservations retain their size.
+						const bool representable = fbcSurfaceBytes <= UINT32_MAX - 0xfffffU;
+						const uint32_t rounded = representable ? static_cast<uint32_t>((fbcSurfaceBytes + 0xfffff) & ~0xfffffULL) : 0;
+						const uint32_t buffer = match->fFramebufferMemorySize ? match->fFramebufferMemorySize :
+							max(rounded, static_cast<uint32_t>(FBCBufferBytes));
 						const uint64_t required = unit + buffer + (9ULL << 20) + 4096;
-						const bool budgetOK = match->fStolenMemorySize && stolenMB && required < (static_cast<uint64_t>(stolenMB) << 20);
-						if (!budgetOK)
+						const bool budgetOK = representable && buffer >= fbcSurfaceBytes && match->fFBMemoryCount && match->fStolenMemorySize && stolenMB && required < (static_cast<uint64_t>(stolenMB) << 20);
+						if (!budgetOK) {
+							match->flags.value &= ~4U;
 							mask &= ~4U;
-						if (mask & 0x10) {
+						}
+						if ((match->flags.value | mask) & 0x10) {
 							// Apple's timer only exists while FBC passes its memory check: never request dynamic FBC without it
 							const auto &panel = match->connectors[0];
 							const char *reason = nullptr;
-							if (!budgetOK)
-								reason = "skipped: DVMT insufficient or unknown";
+							if (lifecycle && (token() & 7) == Closed)
+								reason = "skipped: incomplete lifecycle hooks";
+							else if (!budgetOK)
+								reason = "skipped: invalid FBC reservation or DVMT";
 							else if (!((match->flags.value | mask) & 4))
 								reason = "skipped: FBC off";
 							// MapFBToPort treats the port with index 0 as built-in whatever its type
@@ -1340,14 +1528,18 @@ void IGFX::applyPowerFlags(IOService *controller) {
 								reason = "skipped: unexpected port, pipe or memory count";
 							else if (panel.index != 0)
 								reason = "skipped: connector 0 is not the built-in port (index 0)";
-							if (reason)
+							if (reason) {
+								match->flags.value &= ~0x10U;
 								mask &= ~0x10U;
+							}
 							controller->setProperty("weg-dynamic-fbc-result", reason ? reason :
 								(match->flags.value & 0x10) ? "already set in platform flags" : "requested");
 						}
 						// The table value (or an explicit framebuffer-fbmem) is kept; only a missing buffer is reserved.
 						if (budgetOK && wantFBC && !match->fFramebufferMemorySize)
-							match->fFramebufferMemorySize = FBCBufferBytes;
+							match->fFramebufferMemorySize = buffer;
+						__atomic_store_n(&surfaceReservation, budgetOK && wantFBC ? buffer : 0U, __ATOMIC_RELEASE);
+						controller->setProperty("weg-fbc-surface-bytes", fbcSurfaceBytes, 64);
 						controller->setProperty("weg-fbc-dvmt-mb", stolenMB, 32);
 						controller->setProperty("weg-fbc-required-mb", static_cast<uint32_t>((required + 0xfffff) >> 20), 32);
 						controller->setProperty("weg-fbc-platform-budget-ok", static_cast<uint32_t>(budgetOK), 32);
