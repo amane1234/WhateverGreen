@@ -1334,9 +1334,12 @@ void IGFX::applyPowerFlags(IOService *controller) {
 								reason = "skipped: DVMT insufficient or unknown";
 							else if (!((match->flags.value | mask) & 4))
 								reason = "skipped: FBC off";
-							else if (match->fPortCount > arrsize(match->connectors) || !match->fPipeCount ||
-								!match->fFBMemoryCount || panel.index != 0 || panel.type != ConnectorLVDS)
-								reason = "skipped: internal panel layout unconfirmed";
+							// MapFBToPort treats the port with index 0 as built-in whatever its type
+							else if (match->fPortCount > arrsize(match->connectors) || !match->fPortCount || !match->fPipeCount ||
+								!match->fFBMemoryCount)
+								reason = "skipped: unexpected port, pipe or memory count";
+							else if (panel.index != 0)
+								reason = "skipped: connector 0 is not the built-in port (index 0)";
 							if (reason)
 								mask &= ~0x10U;
 							controller->setProperty("weg-dynamic-fbc-result", reason ? reason :
