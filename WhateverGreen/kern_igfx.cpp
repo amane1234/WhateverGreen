@@ -1020,8 +1020,9 @@ void IGFX::MMIORegistersWriteSupport::disableDependentSubmodules() {
 }
 
 void IGFX::MMIORegistersWriteSupport::wrapWriteRegister32(void *controller, uint32_t address, uint32_t value) {
-	if (!callbackIGFX->admitted())
-		return callbackIGFX->modMMIORegistersWriteSupport.orgWriteRegister32(controller, address, value);
+	// The injectors run synchronously inside Apple's own write, also during a power transition, so
+	// the backlight registers fix and the PSR/DC policies apply as without -igfxpmlifecycle. Only
+	// WhateverGreen's own asynchronous work (backlight fades, ForceWake, PM samples) is gated.
 	// Guard: Perform prologue injections
 	auto prologueInjector = callbackIGFX->modMMIORegistersWriteSupport.prologueList.getInjector(address);
 	if (prologueInjector) {

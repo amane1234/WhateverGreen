@@ -852,6 +852,16 @@ private:
 	void writeRegister32(void *controller, uint32_t address, uint32_t value) {
 		modMMIORegistersWriteSupport.orgWriteRegister32(controller, address, value);
 	}
+
+	/**
+	 *  Read a register from code that runs synchronously inside Apple's own register access, such as an
+	 *  MMIO write injector. Apple's driver is touching the hardware at that moment, so the lifecycle
+	 *  power gate of readRegister32 does not apply. Never call this from WhateverGreen's own timers,
+	 *  workers or callbacks; those use readRegister32.
+	 */
+	uint32_t nativeReadRegister32(void *controller, uint32_t address) {
+		return modMMIORegistersReadSupport.orgReadRegister32(controller, address);
+	}
 	
 	//
 	// MARK: - Individual Fixes

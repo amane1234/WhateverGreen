@@ -99,10 +99,10 @@ void IGFX::BacklightRegistersFix::wrapKBLWriteRegisterPWMFreq1(void *controller,
 	// We'll need this to restore later after system sleep.
 	if (self->targetBacklightFrequency == 0) {
 		// Guard: The system should be initialized with a non-zero PWM frequency
-		if (auto bootValue = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_FREQ1); bootValue != 0 && bootValue != UINT32_MAX) {
+		if (auto bootValue = callbackIGFX->nativeReadRegister32(controller, BXT_BLC_PWM_FREQ1); bootValue != 0 && bootValue != UINT32_MAX) {
 			DBGLOG("igfx", "BLR: [KBL ] WriteRegister32<BXT_BLC_PWM_FREQ1>: System initialized with BXT_BLC_PWM_FREQ1 = 0x%x.", bootValue);
 			DBGLOG("igfx", "BLR: [KBL ] WriteRegister32<BXT_BLC_PWM_FREQ1>: System initialized with BXT_BLC_PWM_CTL1 = 0x%x.",
-				   callbackIGFX->readRegister32(controller, BXT_BLC_PWM_CTL1));
+				   callbackIGFX->nativeReadRegister32(controller, BXT_BLC_PWM_CTL1));
 			self->targetBacklightFrequency = bootValue;
 		} else {
 			SYSLOG("igfx", "BLR: [KBL ] WriteRegister32<BXT_BLC_PWM_FREQ1>: System initialized with BXT_BLC_PWM_FREQ1 = ZERO. Will use the fallback frequency.");
@@ -143,13 +143,13 @@ void IGFX::BacklightRegistersFix::wrapKBLWriteRegisterPWMCtrl1(void *controller,
 	
 	if (self->targetPwmControl == 0) {
 		// Save the original hardware PWM control value
-		auto control = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_CTL1);
+		auto control = callbackIGFX->nativeReadRegister32(controller, BXT_BLC_PWM_CTL1);
 		if (control != UINT32_MAX)
 			self->targetPwmControl = control;
 	}
 
 	DBGLOG("igfx", "BLR: [KBL ] WriteRegister32<BXT_BLC_PWM_CTL1>: Write BXT_BLC_PWM_CTL1 0x%x, previous was 0x%x.",
-		   value, callbackIGFX->readRegister32(controller, BXT_BLC_PWM_CTL1));
+		   value, callbackIGFX->nativeReadRegister32(controller, BXT_BLC_PWM_CTL1));
 
 	if (value) {
 		// Set the PWM frequency before turning it on to avoid the 3 minute blackout bug
@@ -178,7 +178,7 @@ void IGFX::BacklightRegistersFix::wrapCFLWriteRegisterPWMFreq1(void *controller,
 	// We'll need this to restore later after system sleep.
 	if (self->targetBacklightFrequency == 0) {
 		// Guard: The system should be initialized with a non-zero PWM frequency
-		if (auto bootValue = callbackIGFX->readRegister32(controller, BXT_BLC_PWM_FREQ1); bootValue != 0 && bootValue != UINT32_MAX) {
+		if (auto bootValue = callbackIGFX->nativeReadRegister32(controller, BXT_BLC_PWM_FREQ1); bootValue != 0 && bootValue != UINT32_MAX) {
 			DBGLOG("igfx", "BLR: [CFL+] WriteRegister32<BXT_BLC_PWM_FREQ1>: System initialized with BXT_BLC_PWM_FREQ1 = 0x%x.", bootValue);
 			self->targetBacklightFrequency = bootValue;
 		} else {
@@ -205,7 +205,7 @@ void IGFX::BacklightRegistersFix::wrapCFLWriteRegisterPWMDuty1(void *controller,
 	if (value && self->driverBacklightFrequency == 0) {
 		// CFL+ backlight additional fix.
 		DBGLOG("igfx", "BLR: [CFL+] WriteRegister32<BXT_BLC_PWM_DUTY1>: Backlight additional fix was entered.");
-		uint32_t registerValue = callbackIGFX->readRegister32(controller, SFUSE_STRAP);
+		uint32_t registerValue = callbackIGFX->nativeReadRegister32(controller, SFUSE_STRAP);
 		if (registerValue == UINT32_MAX)
 			return;
 		uint32_t selectedFreq = (registerValue & SFUSE_STRAP_RAW_FREQUENCY) ? ICL_FREQ_RAW : ICL_FREQ_NORMAL;
@@ -1554,7 +1554,7 @@ void IGFX::BacklightSmoother::submitRequest(void *controller, uint32_t address, 
 
 	// The framebuffer caller still owns the controller. Recheck the request
 	// after MMIO so an intervening panel-off or replacement wins.
-	auto start = callbackIGFX->readRegister32(controller, address);
+	auto start = callbackIGFX->nativeReadRegister32(controller, address);
 	irq = IOSimpleLockLockDisableInterrupt(smoother.requestLock);
 	const bool current = smoother.request.id == id && smoother.request.controller == controller;
 	if (current) {
