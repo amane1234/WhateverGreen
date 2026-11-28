@@ -345,6 +345,9 @@ private:
 	static void wrapWriteFBCControl(void *controller, uint32_t value);
 	bool fbcVeto {false};
 	const char *fbcVerdict {nullptr};
+	// Compressed buffer the current plane needs and the one reserved, published with a size verdict
+	uint64_t fbcNeededBytes {0}, fbcReservedBytes {0};
+	uint32_t fbcNeededWidth {0}, fbcNeededHeight {0};
 	// The FBC control Apple last asked to enable while the veto held it off, restored when a check passes
 	uint32_t fbcBlockedControl {0};
 	// The stolen framebuffer memory's GTT mapping as found by the first check: 0 unknown, 1 linear, 2 other

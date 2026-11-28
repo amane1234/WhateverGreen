@@ -567,8 +567,13 @@ const char *IGFX::validateFBC(IOService *controller, FBCCheck &c) {
 	if (c.cbBase != appleBase)
 		return "compressed buffer base differs from the driver's reservation";
 	// The compressed data of this plane must fit what the driver reserved (fbmem 0 caused glitches)
-	if (c.cfbBytes > appleSize)
+	if (c.cfbBytes > appleSize) {
+		__atomic_store_n(&fbcNeededBytes, c.cfbBytes, __ATOMIC_RELAXED);
+		__atomic_store_n(&fbcReservedBytes, static_cast<uint64_t>(appleSize), __ATOMIC_RELAXED);
+		__atomic_store_n(&fbcNeededWidth, c.width, __ATOMIC_RELAXED);
+		__atomic_store_n(&fbcNeededHeight, c.height, __ATOMIC_RELAXED);
 		return "compressed buffer smaller than the plane needs";
+	}
 	// intel_fbc_stolen_end: Gen9 FBC assumes the maximum 8 MiB stolen reserved range at the top
 	const uint64_t cfbEnd = static_cast<uint64_t>(c.cbBase) + c.cfbBytes;
 	if (c.stolenSize < 8 * MiB || cfbEnd > c.stolenSize - 8 * MiB)
@@ -665,8 +670,15 @@ void IGFX::setFBCVeto(const char *reason) {
 	// Published only when the verdict changes
 	const char *text = reason ? reason : "ok";
 	if (fbcGuardDevice && __atomic_exchange_n(&fbcVerdict, text, __ATOMIC_ACQ_REL) != text) {
-		char status[96];
-		snprintf(status, sizeof(status), "%s%s", reason ? "FBC off: " : "", text);
+		char status[160];
+		const uint64_t needed = __atomic_load_n(&fbcNeededBytes, __ATOMIC_RELAXED);
+		if (reason && needed && !strcmp(reason, "compressed buffer smaller than the plane needs"))
+			// Round up to whole MiB, as framebuffer-fbmem takes them
+			snprintf(status, sizeof(status), "FBC off: %s (%ux%u plane needs %llu MiB, reserved %llu MiB)", text,
+				__atomic_load_n(&fbcNeededWidth, __ATOMIC_RELAXED), __atomic_load_n(&fbcNeededHeight, __ATOMIC_RELAXED),
+				(needed + MiB - 1) / MiB, __atomic_load_n(&fbcReservedBytes, __ATOMIC_RELAXED) / MiB);
+		else
+			snprintf(status, sizeof(status), "%s%s", reason ? "FBC off: " : "", text);
 		fbcGuardDevice->setProperty("weg-fbc-validation", status);
 		if (reason)
 			SYSLOG("igfx", "FBC turned off: %s", reason);
