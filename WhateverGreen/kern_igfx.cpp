@@ -2020,12 +2020,18 @@ void IGFX::applyPowerFlags(IOService *controller) {
 						const bool wantFBC = ((match->flags.value | mask) & 4) != 0;
 						const uint64_t count = match->fFBMemoryCount ? match->fFBMemoryCount : 1;
 						const uint64_t unit = (match->flags.value & 2) ? match->fStolenMemorySize : match->fStolenMemorySize * count;
-						// The boot mode is a lower bound. Keep the existing 9 MiB fallback for
-						// smaller boot consoles; explicit/native reservations retain their size.
+						// The boot console is only a lower bound: a scaled (HiDPI) desktop scans out a larger surface,
+						// e.g. 2560x1440 needs 15 MiB. An empty reservation therefore takes the largest whole MiB the
+						// memory check still allows, at most the 40 MiB of a 4096x2560 Gen9 compressed buffer, and at
+						// least the boot console and 9 MiB. Explicit/native reservations retain their size.
 						const bool representable = fbcSurfaceBytes <= UINT32_MAX - 0xfffffU;
 						const uint32_t rounded = representable ? static_cast<uint32_t>((fbcSurfaceBytes + 0xfffff) & ~0xfffffULL) : 0;
+						const uint64_t dvmt = static_cast<uint64_t>(stolenMB) << 20;
+						const uint64_t headroom = unit + (9ULL << 20) + 4096;
+						const uint64_t largest = dvmt > headroom ? min((dvmt - headroom - 1) & ~0xfffffULL, 40ULL << 20) : 0;
+						const uint32_t minimum = max(rounded, static_cast<uint32_t>(FBCBufferBytes));
 						const uint32_t buffer = match->fFramebufferMemorySize ? match->fFramebufferMemorySize :
-							max(rounded, static_cast<uint32_t>(FBCBufferBytes));
+							max(static_cast<uint32_t>(largest), minimum);
 						const uint64_t required = unit + buffer + (9ULL << 20) + 4096;
 						const bool budgetOK = representable && buffer >= fbcSurfaceBytes && match->fFBMemoryCount && match->fStolenMemorySize && stolenMB && required < (static_cast<uint64_t>(stolenMB) << 20);
 						if (!budgetOK) {
