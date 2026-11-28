@@ -226,6 +226,9 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 			 cpuGeneration == CPUInfo::CpuGeneration::CoffeeLake ||
 			 cpuGeneration == CPUInfo::CpuGeneration::CometLake) &&
 			PE_parse_boot_argn("igfxpwr", &options, sizeof(options)) && !(options & ~AllPowerOptions)) {
+			// Release builds have no observation: bit 1 and bit 256 are ignored
+			if (!ObservationBuild)
+				options &= ~(Diagnose | RequestDynamicFBC);
 			powerOptions = options;
 			powerFramebufferId = info->reportedFramebufferId;
 			if (options & RequestFBC) {
@@ -402,13 +405,16 @@ void IGFX::installLifecycle(KernelPatcher &patcher, size_t index, mach_vm_addres
 		fbcRefreshCall = thread_call_allocate(reinterpret_cast<thread_call_func_t>(refreshFBC), nullptr);
 	fbcGuardDevice->setProperty("weg-fbc-wake-refresh", !fbcRefreshCall ? "unavailable" :
 		hibernateState ? "after hibernate restore" : "after every wake");
+#ifdef DEBUG
 	if (powerOptions & Diagnose) {
 		fbcWakeCall = thread_call_allocate(reinterpret_cast<thread_call_func_t>(sampleFBCWake), nullptr);
 		fbcGuardDevice->setProperty("weg-fbc-wake-diagnostics", fbcWakeCall ? "installed" : "unavailable");
 	}
+#endif
 }
 
 void IGFX::scheduleFBCWakeSample(void *controller, uint64_t epoch) {
+#ifdef DEBUG
 	if (!fbcWakeCall)
 		return;
 	__atomic_store_n(&fbcWakeController, controller, __ATOMIC_RELAXED);
@@ -419,6 +425,7 @@ void IGFX::scheduleFBCWakeSample(void *controller, uint64_t epoch) {
 	uint64_t deadline;
 	clock_interval_to_deadline(3, kSecondScale, &deadline);
 	thread_call_enter_delayed(static_cast<thread_call_t>(fbcWakeCall), deadline);
+#endif
 }
 
 void IGFX::scheduleFBCRefresh(void *controller, uint64_t epoch) {
@@ -465,8 +472,10 @@ void IGFX::refreshFBC(void *, void *) {
 			__atomic_fetch_add(&s.fbcRefreshes, 1ULL, __ATOMIC_RELAXED);
 			return kIOReturnSuccess;
 		}, controller, const_cast<uint64_t *>(&epoch));
+#ifdef DEBUG
 		if ((s.powerOptions & Diagnose) && s.fbcGuardDevice)
 			s.fbcGuardDevice->setProperty("weg-fbc-wake-refreshes", __atomic_load_n(&s.fbcRefreshes, __ATOMIC_RELAXED), 64);
+#endif
 	}
 	const auto step = __atomic_load_n(&s.fbcRefreshStep, __ATOMIC_RELAXED);
 	if (!step && s.token() == epoch) {
@@ -479,6 +488,7 @@ void IGFX::refreshFBC(void *, void *) {
 }
 
 void IGFX::sampleFBCWake(void *, void *) {
+#ifdef DEBUG
 	auto &s = *callbackIGFX;
 	const auto epoch = __atomic_load_n(&s.fbcWakeEpoch, __ATOMIC_ACQUIRE);
 	auto controller = __atomic_load_n(&s.fbcWakeController, __ATOMIC_RELAXED);
@@ -515,6 +525,7 @@ void IGFX::sampleFBCWake(void *, void *) {
 		clock_interval_to_deadline(27, kSecondScale, &deadline);
 		thread_call_enter_delayed(static_cast<thread_call_t>(s.fbcWakeCall), deadline);
 	}
+#endif
 }
 
 IOReturn IGFX::wrapControllerPower(IOService *controller, unsigned long state, IOService *device) {
@@ -535,8 +546,10 @@ IOReturn IGFX::wrapControllerPower(IOService *controller, unsigned long state, I
 		IOSleep(1);
 	s.modBacklightSmoother.cancelPowerRequests();
 	s.modRPSControlPatch.invalidatePower();
+#ifdef DEBUG
 	if (s.fbcGuardDevice)
 		s.fbcGuardDevice->setProperty("weg-gpu-power-generation", transition >> 3, 64);
+#endif
 	// kIOHibernateStateWakingFromHibernate (2) lasts until hibernate post-wake, after the controller powers up.
 	if (state == 2 && s.hibernateState)
 		__atomic_store_n(&s.fbcWakeHibernate, __atomic_load_n(s.hibernateState, __ATOMIC_RELAXED) == 2, __ATOMIC_RELAXED);
@@ -886,8 +899,10 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 			if (__atomic_compare_exchange_n(&s.powerController, &owner, controller, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || owner == controller) {
 				__atomic_store_n(&s.readyWake, wake, __ATOMIC_RELEASE);
 				if (__atomic_compare_exchange_n(&s.powerToken, &epoch, (epoch & ~7ULL) | Ready, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+#ifdef DEBUG
 					s.modRPSControlPatch.observeDisplayRead(address, value, (epoch & ~7ULL) | Ready);
 					s.scheduleFBCWakeSample(controller, (epoch & ~7ULL) | Ready);
+#endif
 					s.scheduleFBCRefresh(controller, (epoch & ~7ULL) | Ready);
 				}
 			}
@@ -909,10 +924,14 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 	}
 	
 	// Invoke the original function
+#ifdef DEBUG
 	auto generation = (address == 0xA090 || address == 0xA01C) ? callbackIGFX->modRPSControlPatch.currentGeneration() : 0;
+#endif
 	uint32_t retVal = callbackIGFX->modMMIORegistersReadSupport.orgReadRegister32(controller, address);
 	if (s.lifecycle && s.token() != epoch)
 		return retVal;
+#ifdef DEBUG
+	// Observation of Apple's own reads: frequency profile, RC6 report and display registers
 	switch (address) {
 		case 0xA01C:
 			callbackIGFX->modRPSControlPatch.observeFrequency(retVal, generation);
@@ -926,6 +945,7 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 				callbackIGFX->modRPSControlPatch.observeDisplayRead(address, retVal, epoch);
 			break;
 	}
+#endif
 	if (callbackIGFX->modMMIORegistersReadSupport.verbose)
 		DBGLOG("igfx", "RRS: Read MMIO Register = 0x%x; Value = 0x%x.", address, retVal);
 	

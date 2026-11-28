@@ -216,6 +216,16 @@ private:
 		RequestDynamicFBC = 256,
 		AllPowerOptions = 511
 	};
+	/**
+	 *  Observation and measurement exist only in DEBUG builds: igfxpwr bits 1 and 256, igfxrpsc=3,
+	 *  -igfxfreqprofile, the -igfxrc6fix report and the lifecycle and FBC wake diagnostics. A Release
+	 *  build ignores those options and keeps only the options that change behaviour.
+	 */
+#ifdef DEBUG
+	static constexpr bool ObservationBuild = true;
+#else
+	static constexpr bool ObservationBuild = false;
+#endif
 	uint32_t powerOptions {0};
 	uint32_t powerFramebufferId {0};
 	bool powerKblLayout {false};
@@ -1420,8 +1430,10 @@ private:
 		 */
 		struct Event;
 		bool rc6Fix {false};
-		uint64_t nativeRC6Sample {UINT64_MAX}, nativeWake {0};
-		uint32_t lastReportedControl {0}, resetRequests {0}, discontinuities {0};
+		uint64_t nativeRC6Sample {UINT64_MAX};
+		[[maybe_unused]] uint64_t nativeWake {0};
+		[[maybe_unused]] uint32_t lastReportedControl {0};
+		uint32_t resetRequests {0}, discontinuities {0};
 		uint32_t counterGeneration {0}, counterTicks {0};
 		uint64_t counterTime {0};
 		void trackCounter(uint32_t ticks, uint64_t now);
@@ -1431,9 +1443,11 @@ private:
 		uint64_t lastHeldSample {0}, nextVBLRefresh {0}, nextVBLDiscovery {0};
 		IOService *timingFramebuffer {nullptr};
 		uint32_t vblGeneration {0}, discoveryGeneration {UINT32_MAX};
-		bool frequencyProfile {false}, recordingFrequency {false};
-		uint32_t previousBand {32}, frequencyGeneration {0};
-		uint64_t previousFrequencyAt {0}, frequencyBins[32] {}, frequencyWindow {0};
+		bool frequencyProfile {false};
+		// -igfxfreqprofile state, used only in DEBUG builds
+		[[maybe_unused]] bool recordingFrequency {false};
+		[[maybe_unused]] uint32_t previousBand {32}, frequencyGeneration {0};
+		[[maybe_unused]] uint64_t previousFrequencyAt {0}, frequencyBins[32] {}, frequencyWindow {0};
 		void publishFrequency();
 		void (*orgObservedWake)(void *, bool, uint32_t, uint32_t) {nullptr};
 		static void observeWake(void *, bool, uint32_t, uint32_t);
@@ -1441,7 +1455,8 @@ private:
 		void refreshPolicy();
 		int externalPower(uint64_t now);
 		// igfxrpsc=5: cached AC state (-1 unknown, 0 battery, 1 AC), only touched by the reporting worker
-		uint32_t resetGeneration {0}, snapshotGeneration {UINT32_MAX}, busyGeneration {0};
+		uint32_t resetGeneration {0}, busyGeneration {0};
+		[[maybe_unused]] uint32_t snapshotGeneration {UINT32_MAX};
 		uint32_t lastDownWindow {0}, lastIdle {0};
 		bool packageSensor {false}, deadlineBoost {false};
 		uint64_t vblAnchor {0}, vblPeriod {0};
@@ -1469,22 +1484,23 @@ private:
 		// register observations are published (igfxpwr=1 or 256). Bits 2 and 4 alone publish nothing at runtime.
 		bool diagnostics {false}, observe {false};
 		uint64_t sampleTime {0}, sampleWall {0}, telemetryInterval {0}, nextTelemetry {0};
-		uint32_t sampleTicks {0};
+		[[maybe_unused]] uint32_t sampleTicks {0};
 		uint64_t deferBoostUntil {0};
 		int (*readMsr)(uint32_t, uint32_t *, uint32_t *) {nullptr};
 		void sampleTelemetry(void *controller);
 		void publishTelemetry(const Event &event);
 		void sampleEPP();
 		enum { DisplayRegisterCount = 8 };
-		uint64_t displayValues[DisplayRegisterCount] {};
+		[[maybe_unused]] uint64_t displayValues[DisplayRegisterCount] {};
 		uint32_t seenDisplay {0};
 		const uint64_t *lastWake {nullptr};
-		uint64_t telemetryEpoch {0}, publishedEpoch {0}, eppEpoch {0};
+		uint64_t telemetryEpoch {0}, eppEpoch {0};
+		[[maybe_unused]] uint64_t publishedEpoch {0};
 		bool currentEPP() const {
 			return callbackIGFX->lifecycle ? callbackIGFX->token() == __atomic_load_n(&eppEpoch, __ATOMIC_ACQUIRE) :
 				!lastWake || __atomic_load_n(lastWake, __ATOMIC_RELAXED) == __atomic_load_n(&eppEpoch, __ATOMIC_ACQUIRE);
 		}
-		uint32_t lastClock {UINT32_MAX};
+		[[maybe_unused]] uint32_t lastClock {UINT32_MAX};
 		// igfxpwr=8: while the CPU's HWP EPP prefers performance, boost after one busy interval
 		uint64_t fastBoostUntil {0};
 		// igfxpwr=16/32/64: filters on the Apple framebuffer's PSR and DC state writes

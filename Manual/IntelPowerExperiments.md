@@ -4,6 +4,8 @@ These boot arguments target a display-connected Kaby Lake, Coffee Lake or Comet 
 
 ## Daily use
 
+A Release build contains no observation or measurement code: `igfxpwr` bits 1 and 256, `igfxrpsc=3`, `-igfxfreqprofile`, the `-igfxrc6fix` report and the `-igfxpmlifecycle` and FBC wake diagnostics (`weg-gpu-power-generation`, `weg-gpu-ready-generation`, `weg-fbc-surface-valid`, `weg-fbc-wake-*`) are compiled only into Debug builds and ignored by Release builds. Release keeps the options that change behaviour, the boot-time confirmation properties and the FBC refresh after a hibernate restore. Build Debug to use the observation described below.
+
 The options that change behaviour publish nothing at runtime: only a few properties set once at boot confirm the configuration. Observation (`igfxpwr=1` or `256`) and the measure-only mode (`igfxrpsc=3`) are for testing. For daily use, leave bit 1 out of `igfxpwr`, for example `igfxpwr=2 igfxrpsc=5` instead of `igfxpwr=3 igfxrpsc=5`.
 
 | Boot argument | Behaviour |
