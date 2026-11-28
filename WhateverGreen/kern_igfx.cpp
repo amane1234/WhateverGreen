@@ -398,13 +398,18 @@ void IGFX::installLifecycle(KernelPatcher &patcher, size_t index, mach_vm_addres
 	hibernateState = reinterpret_cast<const uint32_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_gIOHibernateState"));
 	if (!hibernateState)
 		patcher.clearError();
-	fbcWriteControl = patcher.solveSymbol<decltype(fbcWriteControl)>(index, "__ZN31AppleIntelFramebufferController15WriteFBCControlEj", address, size);
-	if (!fbcWriteControl)
-		patcher.clearError();
+	// The route keeps Apple from turning FBC back on while a check failed; WhateverGreen's own
+	// off/on cycle calls the original function.
+	KernelPatcher::RouteRequest writeControl("__ZN31AppleIntelFramebufferController15WriteFBCControlEj", wrapWriteFBCControl, orgWriteFBCControl);
+	if (patcher.routeMultiple(index, &writeControl, 1, address, size) && orgWriteFBCControl)
+		fbcWriteControl = orgWriteFBCControl;
 	else
+		patcher.clearError();
+	if (fbcWriteControl)
 		fbcRefreshCall = thread_call_allocate(reinterpret_cast<thread_call_func_t>(refreshFBC), nullptr);
 	fbcGuardDevice->setProperty("weg-fbc-wake-refresh", !fbcRefreshCall ? "unavailable" :
 		hibernateState ? "after hibernate restore" : "after every wake");
+	fbcGuardDevice->setProperty("weg-fbc-supervision", fbcRefreshCall ? "installed" : "unavailable");
 #ifdef DEBUG
 	if (powerOptions & Diagnose) {
 		fbcWakeCall = thread_call_allocate(reinterpret_cast<thread_call_func_t>(sampleFBCWake), nullptr);
@@ -428,19 +433,253 @@ void IGFX::scheduleFBCWakeSample(void *controller, uint64_t epoch) {
 #endif
 }
 
-void IGFX::scheduleFBCRefresh(void *controller, uint64_t epoch) {
+void IGFX::scheduleFBCRefresh(void *controller, uint64_t epoch, bool restart) {
 	if (!fbcRefreshCall)
-		return;
-	// The first ready generation is the boot; S3 wakes keep the native state when the hibernate state is known.
-	const bool boot = !__atomic_exchange_n(&fbcRefreshSeen, true, __ATOMIC_RELAXED);
-	if (boot || (hibernateState && !__atomic_load_n(&fbcWakeHibernate, __ATOMIC_RELAXED)))
 		return;
 	__atomic_store_n(&fbcRefreshController, controller, __ATOMIC_RELAXED);
 	__atomic_store_n(&fbcRefreshStep, 0U, __ATOMIC_RELAXED);
+	__atomic_store_n(&fbcRestartPending, restart, __ATOMIC_RELAXED);
 	__atomic_store_n(&fbcRefreshEpoch, epoch, __ATOMIC_RELEASE);
 	uint64_t deadline;
 	clock_interval_to_deadline(3, kSecondScale, &deadline);
 	thread_call_enter_delayed(static_cast<thread_call_t>(fbcRefreshCall), deadline);
+}
+
+namespace {
+// Gen9 display registers, as named in Linux i915_reg.h / intel_fbc_regs.h
+constexpr uint32_t FBCCBBase = 0x43200;         // ILK_DPFC_CB_BASE: stolen memory offset of the compressed buffer
+constexpr uint32_t FBCControl = 0x43208;        // ILK_DPFC_CONTROL
+constexpr uint32_t FBCChicken = 0x43224;        // ILK_DPFC_CHICKEN
+constexpr uint32_t DisplayArbiter = 0x45000;    // DISP_ARB_CTL
+constexpr uint32_t ChickenMisc4 = 0x4208C;      // CHICKEN_MISC_4 (FBC stride override)
+constexpr uint32_t StolenReserved = 0x1082C0;   // GEN6_STOLEN_RESERVED
+constexpr uint32_t PlaneControl = 0x70180;      // PLANE_CTL(PIPE_A, PLANE_1)
+constexpr uint32_t PlaneStride = 0x70188;       // PLANE_STRIDE
+constexpr uint32_t PlaneSize = 0x70190;         // PLANE_SIZE
+constexpr uint32_t PlaneSurface = 0x7019C;      // PLANE_SURF
+constexpr uint32_t PipeFrameCount = 0x70040;    // PIPE_FRMCOUNT_G4X(PIPE_A)
+constexpr uint32_t FBCEnable = 1U << 31;
+// WaFbcNukeOnHostModify (bit 23) and WaFbcHighMemBwCorruptionAvoidance (bit 8): skl, kbl, cfl
+constexpr uint32_t FBCChickenWorkarounds = 0x800100;
+// WaFbcWakeMemOn (bit 31) and WaFbcTurnOffFbcWatermark (bit 15): skl, kbl, cfl
+constexpr uint32_t ArbiterWorkarounds = 0x80008000;
+// AppleIntelFramebufferController 24H232: memory slots of 0x28 bytes (+0 type, +4 offset, +0x18 first page
+// physical address, +0x20 size), slot 4 is the compressed buffer; +0x37A8 is the offset Apple subtracts
+// for ILK_DPFC_CB_BASE in hwFBCSet; +0x38A0 FBC feature, +0x38A8 FBC state recorded by WriteFBCControl.
+constexpr uint32_t SlotTable = 0x37B8, SlotStride = 0x28, CFBSlot = 4;
+constexpr uint64_t MiB = 1ULL << 20;
+}
+
+const char *IGFX::readFBCState(IOService *controller, FBCCheck &c) {
+	auto pci = OSDynamicCast(IOPCIDevice, fbcGuardDevice);
+	if (!pci)
+		return "GPU PCI device unavailable";
+	// Stolen memory from the GPU's config space: GGC mirror (0x50, GMS) and BSM (0x5C), as i915 reads it
+	const uint16_t ggc = pci->configRead16(WIOKit::kIOPCIConfigGraphicsControl);
+	const uint32_t bsm = pci->configRead32(0x5C);
+	const uint32_t gms = (ggc >> 8) & 0xFF;
+	if (ggc != 0xFFFF && gms >= 1 && gms <= 16)
+		c.stolenSize = gms * 32 * MiB;
+	else if (gms == 0x20 || gms == 0x30 || gms == 0x40)
+		c.stolenSize = gms / 0x10 * 512 * MiB;
+	else if (gms >= 0xF0 && gms <= 0xFE)
+		c.stolenSize = (gms - 0xEF) * 4 * MiB;
+	c.stolenBase = bsm == UINT32_MAX ? 0 : bsm & 0xFFF00000;
+	if (!c.stolenSize || !c.stolenBase)
+		return "stolen memory size or base unknown";
+	const struct { uint32_t reg; uint32_t *value; } registers[] {
+		{FBCControl, &c.control}, {FBCCBBase, &c.cbBase}, {FBCChicken, &c.chicken}, {DisplayArbiter, &c.arbCtl},
+		{ChickenMisc4, &c.misc4}, {StolenReserved, &c.reserved}, {PlaneControl, &c.planeCtl},
+		{PlaneStride, &c.planeStride}, {PlaneSize, &c.planeSize}, {PlaneSurface, &c.planeSurf}
+	};
+	for (auto &r : registers)
+		if ((*r.value = readRegister32(controller, r.reg)) == UINT32_MAX && r.reg != ChickenMisc4)
+			return "display registers unreadable";
+	// Geometry identity of the surface FBC tracks, without its flipping address
+	c.signature = (static_cast<uint64_t>(c.planeCtl & 0x8F001C33) << 32) ^ (static_cast<uint64_t>(c.planeStride) << 16) ^
+		c.planeSize ^ (static_cast<uint64_t>(c.cbBase) << 8) ^ ((c.control >> 6) & 3);
+	return nullptr;
+}
+
+const char *IGFX::validateFBC(IOService *controller, FBCCheck &c) {
+	// Linux intel_fbc_check_plane, Gen9 (DISPLAY_VER 9, not BXT/GLK)
+	if (!(c.planeCtl & (1U << 31)))
+		return "primary plane off";
+	const uint32_t format = (c.planeCtl >> 24) & 0xF, tiling = (c.planeCtl >> 10) & 7, rotation = c.planeCtl & 3;
+	// pixel_format_is_valid: 8:8:8:8 or RGB565. i915 also leaves out formats with alpha; Apple's driver
+	// compresses its primary plane without glitches, so the alpha mode (bits 5:4) is not a reason here.
+	uint32_t cpp = 0;
+	if (format == 4)
+		cpp = 4;
+	else if (format == 14)
+		cpp = 2;
+	if (!cpp)
+		return "pixel format not supported by FBC";
+	// tiling_is_valid (linear, X, Y on Gen9) and rotation_is_valid (no 90/270)
+	uint32_t unit;
+	switch (tiling) {
+		case 0: unit = 64; break;
+		case 1: unit = 512; break;
+		case 4: unit = 128; break;
+		default: return "surface tiling not supported by FBC";
+	}
+	if (rotation & 1)
+		return "90/270 degree rotation not supported by FBC";
+	// stride_is_valid: 64-byte multiple; Display WA #1105 (skl..cfl): linear needs a 512-byte multiple
+	c.strideBytes = (c.planeStride & 0x3FF) * unit;
+	c.width = (c.planeSize & 0x1FFF) + 1;
+	c.height = ((c.planeSize >> 16) & 0x1FFF) + 1;
+	if (!c.strideBytes || (c.strideBytes & 63) || (tiling == 0 && (c.strideBytes & 511)))
+		return "plane stride not supported by FBC";
+	if (c.strideBytes < c.width * cpp)
+		return "plane stride below plane width";
+	// intel_fbc_max_plane_size: 4096x4096 on Gen8/9
+	if (c.width > 4096 || c.height > 4096)
+		return "plane larger than 4096x4096";
+	// intel_fbc_cfb_size / intel_fbc_cfb_stride: 4 bytes per pixel, 512-byte aligned, at most 2560 lines on Gen8+,
+	// and skl_fbc_min_cfb_stride; divided by the compression limit Apple selected (ILK_DPFC_CONTROL bits 7:6)
+	const uint32_t limitBits = (c.control >> 6) & 3;
+	if (limitBits == 3)
+		return "reserved FBC compression limit";
+	c.limit = 1U << limitBits;
+	auto align512 = [](uint64_t v) { return (v + 511) & ~511ULL; };
+	const uint64_t cfbStride = max(align512(static_cast<uint64_t>(c.strideBytes / cpp) * 4), align512(static_cast<uint64_t>(c.width) * 4));
+	c.cfbBytes = cfbStride * min(c.height, 2560U) / c.limit;
+
+	// Compressed buffer base: 4 KiB aligned, past the first stolen page (WaSkipStolenMemoryFirstPage),
+	// and exactly what Apple's hwFBCSet derives from its own compressed buffer slot
+	const uint32_t slot = SlotTable + CFBSlot * SlotStride;
+	const uint32_t appleBase = getMember<uint32_t>(controller, slot + 4) - getMember<uint32_t>(controller, 0x37A8);
+	const uint32_t appleSize = getMember<uint32_t>(controller, slot + 0x20);
+	if (!getMember<uint32_t>(controller, slot) || !appleSize)
+		return "driver reserved no compressed buffer";
+	if ((c.cbBase & 0xFFF) || c.cbBase < 4096)
+		return "compressed buffer base misaligned";
+	if (c.cbBase != appleBase)
+		return "compressed buffer base differs from the driver's reservation";
+	// The compressed data of this plane must fit what the driver reserved (fbmem 0 caused glitches)
+	if (c.cfbBytes > appleSize)
+		return "compressed buffer smaller than the plane needs";
+	// intel_fbc_stolen_end: Gen9 FBC assumes the maximum 8 MiB stolen reserved range at the top
+	const uint64_t cfbEnd = static_cast<uint64_t>(c.cbBase) + c.cfbBytes;
+	if (c.stolenSize < 8 * MiB || cfbEnd > c.stolenSize - 8 * MiB)
+		return "compressed buffer reaches the top 8 MiB of stolen memory";
+
+	// Overlap with the scanout surface when it lives in stolen memory (located through its GTT entry).
+	// Apple's slots are sized generously and its compressed buffer starts 4 KiB before the end of the first
+	// slot (it skips the first stolen page), so the surface in use is checked rather than the slot sizes.
+	{
+		auto gtt = getMember<volatile uint64_t *>(controller, 0x1BE0);
+		const uint64_t entries = getMember<uint32_t>(controller, 0x1BB8) / 8;
+		const uint64_t index = (c.planeSurf & 0xFFFFF000) / 4096;
+		const uint64_t phys = gtt && index + 1 < entries ? gtt[index] & 0x7FFFFFF000ULL : 0;
+		if (phys >= c.stolenBase && phys < c.stolenBase + c.stolenSize) {
+			const uint64_t start = phys - c.stolenBase, end = start + static_cast<uint64_t>(c.strideBytes) * c.height;
+			if (c.cbBase < end && start < cfbEnd)
+				return "compressed buffer overlaps the scanout surface";
+		}
+	}
+	// Overlap with the hardware reserved region (GEN6_STOLEN_RESERVED, 1-8 MiB)
+	if (c.reserved & 1) {
+		const uint64_t rbase = c.reserved & 0xFFF00000, rsize = (1ULL << ((c.reserved >> 7) & 3)) * MiB;
+		if (rbase < c.stolenBase + cfbEnd && c.stolenBase + c.cbBase < rbase + rsize)
+			return "compressed buffer overlaps the hardware reserved region";
+	}
+	c.workaroundsMissing = (c.chicken & FBCChickenWorkarounds) != FBCChickenWorkarounds ||
+		(c.arbCtl & ArbiterWorkarounds) != ArbiterWorkarounds;
+	return validateGTT(controller, c);
+}
+
+const char *IGFX::validateGTT(IOService *controller, const FBCCheck &c) {
+	// The GTT lives in stolen memory and is rebuilt after a hibernate restore. The scanout surface must be
+	// mapped by present entries, and the stolen-backed framebuffer memory must map its own stolen pages.
+	auto gtt = getMember<volatile uint64_t *>(controller, 0x1BE0);
+	const uint64_t gttBytes = getMember<uint32_t>(controller, 0x1BB8);
+	if (!gtt || gttBytes < 16)
+		return "GTT unavailable";
+	const uint64_t entries = gttBytes / 8 - 1;
+	auto pte = [&](uint64_t index) -> uint64_t { return index < entries ? gtt[index] : 0; };
+	const uint64_t surface = c.planeSurf & 0xFFFFF000;
+	const uint64_t pages = (static_cast<uint64_t>(c.strideBytes) * c.height + 4095) / 4096;
+	for (uint64_t i = 0; i < pages; i++)
+		if (!(pte(surface / 4096 + i) & 1))
+			return "scanout surface has unmapped GTT entries";
+	bool linear = true;
+	const uint32_t slots = min(static_cast<uint32_t>(getMember<uint8_t>(controller, 0x2C59)), CFBSlot);
+	for (uint32_t i = 0; i < slots && linear; i++) {
+		const uint32_t entry = SlotTable + i * SlotStride;
+		const uint64_t phys = getMember<uint64_t>(controller, entry + 0x18);
+		const uint64_t offset = getMember<uint32_t>(controller, entry + 4);
+		const uint64_t count = getMember<uint32_t>(controller, entry + 0x20) / 4096;
+		if (getMember<uint32_t>(controller, entry) != 1 || !phys || phys < c.stolenBase || phys >= c.stolenBase + c.stolenSize)
+			continue;
+		for (uint64_t k = 0; k < count && linear; k++)
+			linear = (pte(offset / 4096 + k) & 0x7FFFFFF000ULL) == phys + k * 4096;
+	}
+	// The first check records how the driver maps its stolen framebuffer memory. Only a linear mapping
+	// that later stops being linear (a GTT not rebuilt after a hibernate restore) turns FBC off.
+	// A hibernate restore is not a baseline: its GTT is the mapping under test.
+	uint32_t baseline = __atomic_load_n(&fbcGTTBaseline, __ATOMIC_ACQUIRE);
+	if (!baseline && !__atomic_load_n(&fbcRestartPending, __ATOMIC_RELAXED))
+		__atomic_compare_exchange_n(&fbcGTTBaseline, &baseline, linear ? 1U : 2U, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+	if (baseline == 1 && !linear)
+		return "framebuffer GTT mapping not restored";
+	return nullptr;
+}
+
+bool IGFX::waitFBCDisabled(IOService *controller) {
+	// The disable latches at the next vblank; i915 also activates FBC only a vblank after a plane update.
+	// Complete when the control reads back disabled and pipe A's frame counter advanced twice. A counter
+	// that does not move (pipe idle, e.g. in PSR) completes after 50 ms, when no frame can still be fetched
+	// with the old state. A control that still reads enabled after 100 ms does not complete.
+	const uint32_t first = readRegister32(controller, PipeFrameCount);
+	for (unsigned ms = 2; ms <= 100; ms += 2) {
+		IOSleep(2);
+		const uint32_t control = readRegister32(controller, FBCControl);
+		if (control == UINT32_MAX)
+			return false;
+		if (control & FBCEnable)
+			continue;
+		const uint32_t frame = readRegister32(controller, PipeFrameCount);
+		if (first != UINT32_MAX && frame != UINT32_MAX && frame - first >= 2)
+			return true;
+		if (ms >= 50 && (first == UINT32_MAX || frame == first))
+			return true;
+	}
+	return false;
+}
+
+void IGFX::setFBCVeto(const char *reason) {
+	const bool veto = reason != nullptr;
+	__atomic_store_n(&fbcVeto, veto, __ATOMIC_RELEASE);
+	// Published only when the verdict changes
+	const char *text = reason ? reason : "ok";
+	if (fbcGuardDevice && __atomic_exchange_n(&fbcVerdict, text, __ATOMIC_ACQ_REL) != text) {
+		char status[96];
+		snprintf(status, sizeof(status), "%s%s", reason ? "FBC off: " : "", text);
+		fbcGuardDevice->setProperty("weg-fbc-validation", status);
+		if (reason)
+			SYSLOG("igfx", "FBC turned off: %s", reason);
+	}
+}
+
+void IGFX::wrapWriteFBCControl(void *controller, uint32_t value) {
+	auto &s = *callbackIGFX;
+	// While a check failed, Apple's FBC enables become disables, so its +0x38A8 state stays consistent.
+	if (__atomic_load_n(&s.fbcVeto, __ATOMIC_ACQUIRE)) {
+		__atomic_store_n(&s.fbcBlockedControl, value, __ATOMIC_RELEASE);
+		value &= ~FBCEnable;
+	} else {
+		__atomic_store_n(&s.fbcBlockedControl, 0U, __ATOMIC_RELEASE);
+	}
+	s.orgWriteFBCControl(controller, value);
+}
+
+void IGFX::restoreAppleFBC(IOService *controller) {
+	// Apple asked to enable FBC while it was held off: give it the request now that a check passed.
+	const uint32_t blocked = __atomic_exchange_n(&fbcBlockedControl, 0U, __ATOMIC_ACQ_REL);
+	if ((blocked & FBCEnable) && getMember<uint8_t>(controller, 0x38A0))
+		fbcWriteControl(controller, blocked);
 }
 
 void IGFX::refreshFBC(void *, void *) {
@@ -454,21 +693,83 @@ void IGFX::refreshFBC(void *, void *) {
 		// Gated with Apple's FBC timer and modesets, which run on the controller's work loop.
 		workLoop->runAction([](OSObject *target, void *arg, void *, void *, void *) -> IOReturn {
 			auto &s = *callbackIGFX;
+			auto controller = static_cast<IOService *>(target);
 			const auto epoch = *static_cast<const uint64_t *>(arg);
-			if (s.token() != epoch || !s.admitted() || static_cast<IOService *>(target)->isInactive())
+			const auto mode = __atomic_load_n(&s.modeGeneration, __ATOMIC_ACQUIRE);
+			if (s.token() != epoch || !s.admitted() || (mode & 1) || controller->isInactive() || !getMember<uint8_t>(controller, 0x38A0))
 				return kIOReturnSuccess;
-			// 24H232 WriteFBCControl records the enable state at +0x38A8 and returns early without FBC (+0x38A0).
-			if (!getMember<uint8_t>(target, 0x38A0) || getMember<uint8_t>(target, 0x38A8) != 1)
+			FBCCheck check;
+			// Unreadable state is no verdict: skip this check rather than turn FBC off
+			if (s.readFBCState(controller, check))
 				return kIOReturnSuccess;
-			const uint32_t control = s.readRegister32(target, 0x43208);
-			if (control == UINT32_MAX || !(control & (1U << 31)))
+			const bool enabled = (check.control & FBCEnable) != 0;
+			const bool held = __atomic_load_n(&s.fbcVeto, __ATOMIC_ACQUIRE) || __atomic_load_n(&s.fbcBlockedControl, __ATOMIC_ACQUIRE);
+			// Nothing compresses now and nothing is held off: nothing to check.
+			if (!enabled && !held)
 				return kIOReturnSuccess;
-			s.fbcWriteControl(target, control & ~(1U << 31));
-			// Two 60 Hz frames, so the disable latches before FBC restarts on the current frame.
-			IOSleep(34);
-			// A power transition in between leaves FBC off; Apple sets it again after power-up.
-			if (s.token() == epoch && s.admitted())
-				s.fbcWriteControl(target, control);
+			const char *reason = s.validateFBC(controller, check);
+#ifdef DEBUG
+			if (s.fbcGuardDevice) {
+				s.fbcGuardDevice->setProperty("weg-fbc-check-plane-ctl", check.planeCtl, 64);
+				s.fbcGuardDevice->setProperty("weg-fbc-check-stride-bytes", check.strideBytes, 32);
+				s.fbcGuardDevice->setProperty("weg-fbc-check-plane-size", check.planeSize, 64);
+				s.fbcGuardDevice->setProperty("weg-fbc-check-cb-base", check.cbBase, 64);
+				s.fbcGuardDevice->setProperty("weg-fbc-check-cfb-bytes", check.cfbBytes, 64);
+				s.fbcGuardDevice->setProperty("weg-fbc-check-limit", check.limit, 32);
+				s.fbcGuardDevice->setProperty("weg-fbc-check-stolen-mb", check.stolenSize / MiB, 64);
+				s.fbcGuardDevice->setProperty("weg-fbc-check-workarounds-missing", static_cast<uint32_t>(check.workaroundsMissing), 32);
+				s.fbcGuardDevice->setProperty("weg-fbc-check-result", reason ? reason : "valid");
+				s.fbcGuardDevice->setProperty("weg-fbc-check-gtt-baseline", __atomic_load_n(&s.fbcGTTBaseline, __ATOMIC_RELAXED), 32);
+				s.fbcGuardDevice->setProperty("weg-fbc-check-chicken", check.chicken, 64);
+				s.fbcGuardDevice->setProperty("weg-fbc-check-arb-ctl", check.arbCtl, 64);
+			}
+#endif
+			const bool appleOn = getMember<uint8_t>(controller, 0x38A8) == 1;
+			if (reason) {
+				// Off through Apple's own path, then keep Apple from enabling it again
+				s.setFBCVeto(reason);
+				if (enabled && appleOn) {
+					s.fbcWriteControl(controller, check.control & ~FBCEnable);
+					__atomic_store_n(&s.fbcBlockedControl, check.control, __ATOMIC_RELEASE);
+					s.waitFBCDisabled(controller);
+				}
+				return kIOReturnSuccess;
+			}
+			s.setFBCVeto(nullptr);
+			if (enabled)
+				__atomic_store_n(&s.fbcBlockedControl, 0U, __ATOMIC_RELEASE); // Apple enabled FBC itself
+			if (!enabled) {
+				// The state Apple programmed is valid again: hand back an enable the veto held off.
+				s.restoreAppleFBC(controller);
+				return kIOReturnSuccess;
+			}
+			const bool restart = __atomic_load_n(&s.fbcRestartPending, __ATOMIC_RELAXED) || check.workaroundsMissing;
+			if (!restart || !appleOn)
+				return kIOReturnSuccess;
+			// Re-initialise the compression state: FBC off until the disable completed, the Gen9 workaround
+			// bits Apple's hwFBCSet sets, then on again for the same surface generation only.
+			s.fbcWriteControl(controller, check.control & ~FBCEnable);
+			if (!s.waitFBCDisabled(controller)) {
+				// Unconfirmed disable: keep FBC off and remember Apple's enable for the next passing check.
+				s.setFBCVeto("FBC disable did not complete");
+				__atomic_store_n(&s.fbcBlockedControl, check.control, __ATOMIC_RELEASE);
+				return kIOReturnSuccess;
+			}
+			if (check.workaroundsMissing) {
+				s.writeRegister32(controller, FBCChicken, check.chicken | FBCChickenWorkarounds);
+				s.writeRegister32(controller, DisplayArbiter, check.arbCtl | ArbiterWorkarounds);
+			}
+			FBCCheck after;
+			// A power transition: Apple programs FBC again after power-up
+			if (s.token() != epoch || !s.admitted())
+				return kIOReturnSuccess;
+			// A new surface generation: keep Apple's enable for the next check of that surface
+			if (__atomic_load_n(&s.modeGeneration, __ATOMIC_ACQUIRE) != mode || s.readFBCState(controller, after) ||
+				after.signature != check.signature) {
+				__atomic_store_n(&s.fbcBlockedControl, check.control, __ATOMIC_RELEASE);
+				return kIOReturnSuccess;
+			}
+			s.fbcWriteControl(controller, check.control);
 			__atomic_fetch_add(&s.fbcRefreshes, 1ULL, __ATOMIC_RELAXED);
 			return kIOReturnSuccess;
 		}, controller, const_cast<uint64_t *>(&epoch));
@@ -479,7 +780,7 @@ void IGFX::refreshFBC(void *, void *) {
 	}
 	const auto step = __atomic_load_n(&s.fbcRefreshStep, __ATOMIC_RELAXED);
 	if (!step && s.token() == epoch) {
-		// Dynamic FBC can turn FBC on only later; try once more.
+		// Dynamic FBC can turn FBC on only later; check once more.
 		__atomic_store_n(&s.fbcRefreshStep, 1U, __ATOMIC_RELAXED);
 		uint64_t deadline;
 		clock_interval_to_deadline(27, kSecondScale, &deadline);
@@ -602,6 +903,8 @@ IOReturn IGFX::wrapMode(IOFramebuffer *fb, int mode, int depth) {
 	if (!result && s.admitted()) {
 		IOPixelInformation pixels {};
 		fb->getPixelInformation(mode, depth, kIOFBSystemAperture, &pixels);
+		// Check the new surface against the FBC rules; no restart
+		s.scheduleFBCRefresh(getMember<void *>(fb, 0x1D0), s.token(), false);
 	}
 	return result;
 }
@@ -611,7 +914,8 @@ bool IGFX::fbcReady(void *controller) const {
 		return true;
 	auto epoch = token();
 	auto mode = __atomic_load_n(&modeGeneration, __ATOMIC_ACQUIRE);
-	return controller && admitted() && (epoch & 7) == Ready && !(mode & 1) && controller == __atomic_load_n(&powerController, __ATOMIC_ACQUIRE) &&
+	return controller && admitted() && !__atomic_load_n(&fbcVeto, __ATOMIC_ACQUIRE) && (epoch & 7) == Ready && !(mode & 1) &&
+		controller == __atomic_load_n(&powerController, __ATOMIC_ACQUIRE) &&
 		__atomic_load_n(&surfaceToken, __ATOMIC_ACQUIRE) == epoch &&
 		__atomic_load_n(&surfaceMode, __ATOMIC_ACQUIRE) == mode && getMember<uint8_t>(controller, 0x38A0);
 }
@@ -903,7 +1207,10 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 					s.modRPSControlPatch.observeDisplayRead(address, value, (epoch & ~7ULL) | Ready);
 					s.scheduleFBCWakeSample(controller, (epoch & ~7ULL) | Ready);
 #endif
-					s.scheduleFBCRefresh(controller, (epoch & ~7ULL) | Ready);
+					// Every ready generation is checked; compression restarts after a hibernate restore.
+					const bool boot = !__atomic_exchange_n(&s.fbcRefreshSeen, true, __ATOMIC_RELAXED);
+					s.scheduleFBCRefresh(controller, (epoch & ~7ULL) | Ready, !boot &&
+						(!s.hibernateState || __atomic_load_n(&s.fbcWakeHibernate, __ATOMIC_RELAXED)));
 				}
 			}
 		}
@@ -1637,10 +1944,12 @@ bool IGFX::wrapAcceleratorStart(IOService *that, IOService *provider) {
 }
 
 void IGFX::setFBCGeometry(uint32_t width, uint32_t height, uint32_t stride) {
-	// The boot console can use a lower depth than the accelerated scanout.
+	// The boot console can use a lower depth than the accelerated scanout. Size the compressed buffer as
+	// Linux intel_fbc_cfb_size does on Gen9 at a 1:1 limit: 4 bytes per pixel, a 512-byte aligned stride
+	// (skl_fbc_min_cfb_stride) and at most 2560 lines.
 	if (width && height && stride) {
-		const uint64_t pitch = max(static_cast<uint64_t>(stride), static_cast<uint64_t>(width) * 4);
-		fbcSurfaceBytes = pitch > UINT32_MAX ? UINT64_MAX : pitch * height;
+		const uint64_t pitch = (max(static_cast<uint64_t>(stride), static_cast<uint64_t>(width) * 4) + 511) & ~511ULL;
+		fbcSurfaceBytes = pitch > UINT32_MAX ? UINT64_MAX : pitch * min(height, 2560U);
 	}
 }
 

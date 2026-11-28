@@ -312,9 +312,41 @@ private:
 	void *fbcRefreshController {nullptr};
 	uint64_t fbcRefreshEpoch {UINT64_MAX}, fbcRefreshes {0};
 	uint32_t fbcRefreshStep {0};
-	bool fbcRefreshSeen {false};
-	void scheduleFBCRefresh(void *controller, uint64_t epoch);
+	bool fbcRefreshSeen {false}, fbcRestartPending {false};
+	void scheduleFBCRefresh(void *controller, uint64_t epoch, bool restart);
 	static void refreshFBC(void *, void *);
+
+	/**
+	 *  i915-style FBC supervision (-igfxpmlifecycle, 24H232 CFL). After every ready generation and modeset,
+	 *  check what Apple's driver programmed against the Gen9 rules of Linux intel_fbc.c: plane format,
+	 *  tiling, rotation, stride and size; the compressed buffer size for the current plane and compression
+	 *  limit; the buffer base against Apple's own reservation; overlap with the framebuffer memory and the
+	 *  hardware reserved region, and the 8 MiB the Gen9 FBC hardware assumes reserved at the top of stolen
+	 *  memory; the scanout GTT mapping; and the Gen9 FBC workaround bits. A failed check turns FBC off through
+	 *  Apple's WriteFBCControl and keeps it off (fbcVeto) until a later check passes.
+	 */
+	struct FBCCheck {
+		uint32_t planeCtl {UINT32_MAX}, planeStride {UINT32_MAX}, planeSize {UINT32_MAX}, planeSurf {UINT32_MAX};
+		uint32_t control {UINT32_MAX}, cbBase {UINT32_MAX}, chicken {UINT32_MAX}, arbCtl {UINT32_MAX}, misc4 {UINT32_MAX};
+		uint32_t reserved {UINT32_MAX}, width {0}, height {0}, strideBytes {0}, limit {1};
+		uint64_t stolenBase {0}, stolenSize {0}, cfbBytes {0};
+		uint64_t signature {0};
+		bool workaroundsMissing {false};
+	};
+	const char *readFBCState(IOService *controller, FBCCheck &check);
+	const char *validateFBC(IOService *controller, FBCCheck &check);
+	const char *validateGTT(IOService *controller, const FBCCheck &check);
+	bool waitFBCDisabled(IOService *controller);
+	void setFBCVeto(const char *reason);
+	void (*orgWriteFBCControl)(void *, uint32_t) {nullptr};
+	static void wrapWriteFBCControl(void *controller, uint32_t value);
+	bool fbcVeto {false};
+	const char *fbcVerdict {nullptr};
+	// The FBC control Apple last asked to enable while the veto held it off, restored when a check passes
+	uint32_t fbcBlockedControl {0};
+	// The stolen framebuffer memory's GTT mapping as found by the first check: 0 unknown, 1 linear, 2 other
+	uint32_t fbcGTTBaseline {0};
+	void restoreAppleFBC(IOService *controller);
 	IORegistryEntry *fbcGuardDevice {nullptr};
 	void (*orgUpdateFBC)(void *, uint32_t) {nullptr};
 	static void wrapUpdateFBC(void *framebuffer, uint32_t event);
