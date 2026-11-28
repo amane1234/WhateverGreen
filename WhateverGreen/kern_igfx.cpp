@@ -228,8 +228,12 @@ void IGFX::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 				}
 				// The compressed buffer is reserved even when an explicit framebuffer-flags patch sets FBC.
 				reserveFBCMemory = true;
-				if (!framebufferPatchFlags.bits.FPFFlags)
+				if (!framebufferPatchFlags.bits.FPFFlags) {
 					powerFlagMask |= 0x4; // FBFramebufferCompression
+					// Dynamic FBC rides on the same check and buffer; bit 256 stays observation only
+					if (checkKernelArgument("-igfxdynfbc"))
+						powerFlagMask |= 0x10; // FBDynamicFBCEnable
+				}
 			}
 			if (!framebufferPatchFlags.bits.FPFFlags) {
 				if (options & RequestDynamicFBC)
@@ -1322,6 +1326,22 @@ void IGFX::applyPowerFlags(IOService *controller) {
 						const bool budgetOK = match->fStolenMemorySize && stolenMB && required < (static_cast<uint64_t>(stolenMB) << 20);
 						if (!budgetOK)
 							mask &= ~4U;
+						if (mask & 0x10) {
+							// Apple's timer only exists while FBC passes its memory check: never request dynamic FBC without it
+							const auto &panel = match->connectors[0];
+							const char *reason = nullptr;
+							if (!budgetOK)
+								reason = "skipped: DVMT insufficient or unknown";
+							else if (!((match->flags.value | mask) & 4))
+								reason = "skipped: FBC off";
+							else if (match->fPortCount > arrsize(match->connectors) || !match->fPipeCount ||
+								!match->fFBMemoryCount || panel.index != 0 || panel.type != ConnectorLVDS)
+								reason = "skipped: internal panel layout unconfirmed";
+							if (reason)
+								mask &= ~0x10U;
+							controller->setProperty("weg-dynamic-fbc-result", reason ? reason :
+								(match->flags.value & 0x10) ? "already set in platform flags" : "requested");
+						}
 						// The table value (or an explicit framebuffer-fbmem) is kept; only a missing buffer is reserved.
 						if (budgetOK && wantFBC && !match->fFramebufferMemorySize)
 							match->fFramebufferMemorySize = FBCBufferBytes;
