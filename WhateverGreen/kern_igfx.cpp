@@ -450,11 +450,12 @@ bool IGFX::checkFBCMargin() {
 	if (!pci)
 		return status("refused: GPU PCI device unavailable");
 
-	// Stolen memory as Apple's initStolenMemory reads it: size from the GGC GMS field, base from BDSM
+	// Stolen memory from the GPU's own config space: size from the GGC mirror (0x50, GMS field), base from
+	// BSM (0x5C, bits 31:20), as i915 reads it. 0xB0/0xB4 hold BDSM/BGSM only in the host bridge.
 	const uint16_t ggc = pci->configRead16(WIOKit::kIOPCIConfigGraphicsControl);
-	const uint32_t bdsmRaw = pci->configRead32(0xB4);
+	const uint32_t bdsmRaw = pci->configRead32(0x5C);
 	device->setProperty("weg-fbc-ggc-raw", ggc, 16);
-	device->setProperty("weg-fbc-bdsm-raw", bdsmRaw, 32);
+	device->setProperty("weg-fbc-bsm-raw", bdsmRaw, 32);
 	const uint32_t gms = (ggc >> 8) & 0xFF;
 	uint32_t stolen = 0;
 	if (ggc != 0xFFFF && gms >= 1 && gms <= 16)
@@ -467,7 +468,7 @@ bool IGFX::checkFBCMargin() {
 	if (!stolen)
 		return status("refused: stolen memory size unknown (weg-fbc-ggc-raw)");
 	if (!bdsm)
-		return status("refused: stolen memory base unknown (weg-fbc-bdsm-raw)");
+		return status("refused: stolen memory base unknown (weg-fbc-bsm-raw)");
 
 	auto map = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
 	if (!map || map->getLength() < 0x1082C4) {
