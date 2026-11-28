@@ -291,6 +291,20 @@ private:
 	const uint32_t *hibernateState {nullptr};
 	void scheduleFBCWakeSample(void *controller, uint64_t epoch);
 	static void sampleFBCWake(void *, void *);
+	/**
+	 *  After a hibernate restore (every wake when the kernel symbol is unavailable), FBC can keep
+	 *  compressing against stale data. 3 s and 30 s after the GPU is ready, if Apple's driver has FBC
+	 *  enabled, turn it off and on again through Apple's own WriteFBCControl on the controller's work
+	 *  loop, so the hardware recompresses from the current frame and Apple's FBC state stays consistent.
+	 */
+	void (*fbcWriteControl)(void *, uint32_t) {nullptr};
+	void *fbcRefreshCall {nullptr};
+	void *fbcRefreshController {nullptr};
+	uint64_t fbcRefreshEpoch {UINT64_MAX}, fbcRefreshes {0};
+	uint32_t fbcRefreshStep {0};
+	bool fbcRefreshSeen {false};
+	void scheduleFBCRefresh(void *controller, uint64_t epoch);
+	static void refreshFBC(void *, void *);
 	IORegistryEntry *fbcGuardDevice {nullptr};
 	void (*orgUpdateFBC)(void *, uint32_t) {nullptr};
 	static void wrapUpdateFBC(void *framebuffer, uint32_t event);

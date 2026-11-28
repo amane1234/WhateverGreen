@@ -160,6 +160,13 @@ void IGFX::init() {
 }
 
 void IGFX::deinit() {
+	if (fbcRefreshCall) {
+		auto call = static_cast<thread_call_t>(fbcRefreshCall);
+		thread_call_cancel(call);
+		while (!thread_call_free(call))
+			IOSleep(1);
+		fbcRefreshCall = nullptr;
+	}
 	if (fbcWakeCall) {
 		auto call = static_cast<thread_call_t>(fbcWakeCall);
 		thread_call_cancel(call);
@@ -385,10 +392,17 @@ void IGFX::installLifecycle(KernelPatcher &patcher, size_t index, mach_vm_addres
 	}
 	__atomic_store_n(&powerToken, static_cast<uint64_t>(AwaitClock), __ATOMIC_RELEASE);
 	fbcGuardDevice->setProperty("weg-gpu-lifecycle", "installed");
+	hibernateState = reinterpret_cast<const uint32_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_gIOHibernateState"));
+	if (!hibernateState)
+		patcher.clearError();
+	fbcWriteControl = patcher.solveSymbol<decltype(fbcWriteControl)>(index, "__ZN31AppleIntelFramebufferController15WriteFBCControlEj", address, size);
+	if (!fbcWriteControl)
+		patcher.clearError();
+	else
+		fbcRefreshCall = thread_call_allocate(reinterpret_cast<thread_call_func_t>(refreshFBC), nullptr);
+	fbcGuardDevice->setProperty("weg-fbc-wake-refresh", !fbcRefreshCall ? "unavailable" :
+		hibernateState ? "after hibernate restore" : "after every wake");
 	if (powerOptions & Diagnose) {
-		hibernateState = reinterpret_cast<const uint32_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_gIOHibernateState"));
-		if (!hibernateState)
-			patcher.clearError();
 		fbcWakeCall = thread_call_allocate(reinterpret_cast<thread_call_func_t>(sampleFBCWake), nullptr);
 		fbcGuardDevice->setProperty("weg-fbc-wake-diagnostics", fbcWakeCall ? "installed" : "unavailable");
 	}
@@ -405,6 +419,63 @@ void IGFX::scheduleFBCWakeSample(void *controller, uint64_t epoch) {
 	uint64_t deadline;
 	clock_interval_to_deadline(3, kSecondScale, &deadline);
 	thread_call_enter_delayed(static_cast<thread_call_t>(fbcWakeCall), deadline);
+}
+
+void IGFX::scheduleFBCRefresh(void *controller, uint64_t epoch) {
+	if (!fbcRefreshCall)
+		return;
+	// The first ready generation is the boot; S3 wakes keep the native state when the hibernate state is known.
+	const bool boot = !__atomic_exchange_n(&fbcRefreshSeen, true, __ATOMIC_RELAXED);
+	if (boot || (hibernateState && !__atomic_load_n(&fbcWakeHibernate, __ATOMIC_RELAXED)))
+		return;
+	__atomic_store_n(&fbcRefreshController, controller, __ATOMIC_RELAXED);
+	__atomic_store_n(&fbcRefreshStep, 0U, __ATOMIC_RELAXED);
+	__atomic_store_n(&fbcRefreshEpoch, epoch, __ATOMIC_RELEASE);
+	uint64_t deadline;
+	clock_interval_to_deadline(3, kSecondScale, &deadline);
+	thread_call_enter_delayed(static_cast<thread_call_t>(fbcRefreshCall), deadline);
+}
+
+void IGFX::refreshFBC(void *, void *) {
+	auto &s = *callbackIGFX;
+	const auto epoch = __atomic_load_n(&s.fbcRefreshEpoch, __ATOMIC_ACQUIRE);
+	auto controller = static_cast<IOService *>(__atomic_load_n(&s.fbcRefreshController, __ATOMIC_RELAXED));
+	if (!controller || s.token() != epoch)
+		return;
+	auto workLoop = controller->getWorkLoop();
+	if (workLoop) {
+		// Gated with Apple's FBC timer and modesets, which run on the controller's work loop.
+		workLoop->runAction([](OSObject *target, void *arg, void *, void *, void *) -> IOReturn {
+			auto &s = *callbackIGFX;
+			const auto epoch = *static_cast<const uint64_t *>(arg);
+			if (s.token() != epoch || !s.admitted() || static_cast<IOService *>(target)->isInactive())
+				return kIOReturnSuccess;
+			// 24H232 WriteFBCControl records the enable state at +0x38A8 and returns early without FBC (+0x38A0).
+			if (!getMember<uint8_t>(target, 0x38A0) || getMember<uint8_t>(target, 0x38A8) != 1)
+				return kIOReturnSuccess;
+			const uint32_t control = s.readRegister32(target, 0x43208);
+			if (control == UINT32_MAX || !(control & (1U << 31)))
+				return kIOReturnSuccess;
+			s.fbcWriteControl(target, control & ~(1U << 31));
+			// Two 60 Hz frames, so the disable latches before FBC restarts on the current frame.
+			IOSleep(34);
+			// A power transition in between leaves FBC off; Apple sets it again after power-up.
+			if (s.token() == epoch && s.admitted())
+				s.fbcWriteControl(target, control);
+			__atomic_fetch_add(&s.fbcRefreshes, 1ULL, __ATOMIC_RELAXED);
+			return kIOReturnSuccess;
+		}, controller, const_cast<uint64_t *>(&epoch));
+		if ((s.powerOptions & Diagnose) && s.fbcGuardDevice)
+			s.fbcGuardDevice->setProperty("weg-fbc-wake-refreshes", __atomic_load_n(&s.fbcRefreshes, __ATOMIC_RELAXED), 64);
+	}
+	const auto step = __atomic_load_n(&s.fbcRefreshStep, __ATOMIC_RELAXED);
+	if (!step && s.token() == epoch) {
+		// Dynamic FBC can turn FBC on only later; try once more.
+		__atomic_store_n(&s.fbcRefreshStep, 1U, __ATOMIC_RELAXED);
+		uint64_t deadline;
+		clock_interval_to_deadline(27, kSecondScale, &deadline);
+		thread_call_enter_delayed(static_cast<thread_call_t>(s.fbcRefreshCall), deadline);
+	}
 }
 
 void IGFX::sampleFBCWake(void *, void *) {
@@ -817,6 +888,7 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 				if (__atomic_compare_exchange_n(&s.powerToken, &epoch, (epoch & ~7ULL) | Ready, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
 					s.modRPSControlPatch.observeDisplayRead(address, value, (epoch & ~7ULL) | Ready);
 					s.scheduleFBCWakeSample(controller, (epoch & ~7ULL) | Ready);
+					s.scheduleFBCRefresh(controller, (epoch & ~7ULL) | Ready);
 				}
 			}
 		}
