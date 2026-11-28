@@ -9,7 +9,7 @@ The options that change behaviour publish nothing at runtime: only a few propert
 | Boot argument | Behaviour |
 | --- | --- |
 | `igfxpwr=1` | Observe: GT RC6 residency and the display registers the Apple framebuffer already reads. No new timer. Changes nothing. |
-| `igfxpwr=2` | Request native FBC (`0x4`) after checking the DVMT against the platform's stolen memory. |
+| `igfxpwr=2` | Request native FBC (`0x4`) and reserve its compressed buffer, after the same DVMT check Apple's driver makes (see below). |
 | `igfxpwr=4` | Request native dynamic CDCLK (`0x200000`). |
 | `igfxpwr=8` | With `igfxrpsc=1`, `4` or `5`, follow the CPU's HWP EPP (see below). |
 | `igfxpwr=16` | PSR off: the enable bit is cleared from the framebuffer's PSR1/PSR2 control writes. |
@@ -21,6 +21,7 @@ The options that change behaviour publish nothing at runtime: only a few propert
 | `igfxrpsc=4` | Boost to RP0 only while the measured hardware load stays high. |
 | `igfxrpsc=5` | Three-tier boost limited by AC/battery and CPU temperature. |
 | `-igfxvblboost` | With `igfxrpsc=5`, promote a middle-tier request to RP0 near the next predicted VBL. |
+| `-igfxfbctimerguard` | 24H232 CFL framebuffer only: skip FBC timer arming when the controller has no timer object. Use it with dynamic FBC. |
 | `-igfxfreqprofile` | With observation (`igfxpwr=1`), a 50 MHz GT frequency histogram from Apple's own RPSTAT1 reads. Testing only. |
 | `igfxfcms=0` | Existing independent option with the same modeset effect as `igfxpwr=128`; `igfxfcms` and `complete-modeset` take precedence. |
 
@@ -29,7 +30,8 @@ Add the `igfxpwr` values to combine them. Try one policy change per boot. The di
 ## Properties set once at boot
 
 * `weg-power-framebuffer-matched` and `weg-power-framebuffer-flags`: the Apple controller found the selected platform entry, and its flags after the request.
-* FBC check: the request is added only when the DVMT (GMS field of the GPU's GGC register) holds the selected entry's stolen memory plus its boot framebuffer memory, the FAQ's TOTAL STOLEN (slightly conservative). Stolen memory times `FBMemoryCount` is the all-pipes MAX STOLEN and is not required. `weg-fbc-gms-raw`, `weg-fbc-dvmt-mb`, `weg-fbc-required-mb` and `weg-fbc-platform-budget-ok` report the check; a DVMT of 0 means the GMS value was not recognized and the FBC request was dropped. Dynamic FBC stays under native policy (`weg-dynamic-fbc-policy`).
+* FBC check: Apple's framebuffer controller (24H232 CFL `FBMemMgr_Init`) keeps FBC on only while the framebuffer stolen memory (one `framebuffer-stolenmem` unit with platform flag `0x2`, otherwise one per memory slot) plus the compressed buffer (`framebuffer-fbmem`) plus 1 MiB stays below the stolen pool (DVMT - 4 KiB) minus 8 MiB. The CFL/CML tables have no compressed buffer (fbmem 0): the hardware then compresses into memory the driver does not reserve, which showed as display glitches. `igfxpwr=2` applies the same check and, where the table has no buffer, reserves 9 MiB (enough for 1920x1200 at 4 bytes per pixel; set `framebuffer-fbmem` for a larger panel). It also reserves the buffer when an explicit `framebuffer-flags` patch enables FBC. `weg-fbc-gms-raw`, `weg-fbc-dvmt-mb`, `weg-fbc-required-mb` (DVMT the check needs), `weg-fbc-platform-budget-ok` and `weg-fbc-buffer-mb` (compressed buffer, 0 when FBC was not requested) report the check; a DVMT of 0 means the GMS value was not recognized and the FBC request was dropped. With the 57 MiB stolen memory of `0x3E9B0000`, FBC needs a 96 MiB DVMT, or 64 MiB with `framebuffer-stolenmem` at 44 MiB. Dynamic FBC stays under native policy (`weg-dynamic-fbc-policy`); to use it set bit `0x10` with `framebuffer-flags` and add `-igfxfbctimerguard`.
+* `weg-fbc-timer-guard` (`installed`, `UUID mismatch` or `route failed`) confirms `-igfxfbctimerguard`.
 * `weg-rps-control-mode`, `weg-power-psr-policy`, `weg-power-dc-policy` and `weg-power-native-modeset` confirm the selected modes.
 * `-igfxrc6fix` keeps its `weg-rc6-*` status properties, which change only on RC6 events.
 

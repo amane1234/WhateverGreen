@@ -218,6 +218,25 @@ private:
 	void applyPowerFlags(IOService *controller);
 
 	/**
+	 *  igfxpwr=2 also reserves the FBC compressed buffer. The framebuffer controller (24H232 CFL
+	 *  FBMemMgr_Init) sizes it from fFramebufferMemorySize, which is 0 in the CFL/CML tables, and
+	 *  only enables FBC while stolen + fbmem + 1 MiB stays below the stolen pool (DVMT - 4 KiB)
+	 *  minus 8 MiB. With fbmem 0 the hardware compresses into memory the driver does not reserve,
+	 *  which showed as display glitches. 9 MiB covers a 1920x1200 panel at 4 bytes per pixel.
+	 */
+	static constexpr uint32_t FBCBufferBytes = 9U << 20;
+	bool reserveFBCMemory {false};
+
+	/**
+	 *  -igfxfbctimerguard (24H232 CFL framebuffer only): UpdateFBC can arm the FBC transaction
+	 *  timer through a controller that has no timer object. Skip those calls instead.
+	 */
+	bool guardFBCTimer {false};
+	IORegistryEntry *fbcGuardDevice {nullptr};
+	void (*orgUpdateFBC)(void *, uint32_t) {nullptr};
+	static void wrapUpdateFBC(void *framebuffer, uint32_t event);
+
+	/**
 	 *  Framebuffer list is in Sandy Bridge format
 	 */
 	bool gPlatformListIsSNB {false};
