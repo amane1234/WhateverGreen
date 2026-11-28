@@ -18,6 +18,7 @@
 
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOFramebuffer.h>
+#include <kern/thread_call.h>
 
 IGFX *IGFX::callbackIGFX;
 
@@ -159,6 +160,13 @@ void IGFX::init() {
 }
 
 void IGFX::deinit() {
+	if (fbcWakeCall) {
+		auto call = static_cast<thread_call_t>(fbcWakeCall);
+		thread_call_cancel(call);
+		while (!thread_call_free(call))
+			IOSleep(1);
+		fbcWakeCall = nullptr;
+	}
 	OSSafeReleaseNULL(fbcGuardDevice);
 	// Deinitialize each submodule
 	for (auto submodule : submodules)
@@ -377,6 +385,65 @@ void IGFX::installLifecycle(KernelPatcher &patcher, size_t index, mach_vm_addres
 	}
 	__atomic_store_n(&powerToken, static_cast<uint64_t>(AwaitClock), __ATOMIC_RELEASE);
 	fbcGuardDevice->setProperty("weg-gpu-lifecycle", "installed");
+	if (powerOptions & Diagnose) {
+		hibernateState = reinterpret_cast<const uint32_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_gIOHibernateState"));
+		if (!hibernateState)
+			patcher.clearError();
+		fbcWakeCall = thread_call_allocate(reinterpret_cast<thread_call_func_t>(sampleFBCWake), nullptr);
+		fbcGuardDevice->setProperty("weg-fbc-wake-diagnostics", fbcWakeCall ? "installed" : "unavailable");
+	}
+}
+
+void IGFX::scheduleFBCWakeSample(void *controller, uint64_t epoch) {
+	if (!fbcWakeCall)
+		return;
+	__atomic_store_n(&fbcWakeController, controller, __ATOMIC_RELAXED);
+	__atomic_store_n(&fbcWakeStep, 0U, __ATOMIC_RELAXED);
+	// The first ready generation after boot is the baseline for later wakes.
+	__atomic_store_n(&fbcWakeBoot, !__atomic_exchange_n(&fbcWakeScheduled, true, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+	__atomic_store_n(&fbcWakeEpoch, epoch, __ATOMIC_RELEASE);
+	uint64_t deadline;
+	clock_interval_to_deadline(3, kSecondScale, &deadline);
+	thread_call_enter_delayed(static_cast<thread_call_t>(fbcWakeCall), deadline);
+}
+
+void IGFX::sampleFBCWake(void *, void *) {
+	auto &s = *callbackIGFX;
+	const auto epoch = __atomic_load_n(&s.fbcWakeEpoch, __ATOMIC_ACQUIRE);
+	auto controller = __atomic_load_n(&s.fbcWakeController, __ATOMIC_RELAXED);
+	if (!controller || !s.fbcGuardDevice || s.token() != epoch)
+		return;
+	static constexpr struct { uint32_t reg; const char *name; } registers[] {
+		{0x43208, "dpfc-control"}, {0x43214, "dpfc-status2"}, {0x43224, "dpfc-chicken"},
+		{0x45000, "disp-arb-ctl"}, {0x4208C, "chicken-misc4"}, {0x43200, "cb-base"}
+	};
+	uint32_t values[arrsize(registers)];
+	for (size_t i = 0; i < arrsize(registers); i++)
+		values[i] = s.readRegister32(controller, registers[i].reg);
+	// A power transition during the reads makes the set inconsistent.
+	if (s.token() != epoch)
+		return;
+	const auto step = __atomic_load_n(&s.fbcWakeStep, __ATOMIC_RELAXED);
+	char prefix[24], key[64];
+	snprintf(prefix, sizeof(prefix), "weg-fbc-%s-%s", __atomic_load_n(&s.fbcWakeBoot, __ATOMIC_RELAXED) ? "boot" : "wake", step ? "30s" : "3s");
+	for (size_t i = 0; i < arrsize(registers); i++) {
+		snprintf(key, sizeof(key), "%s-%s", prefix, registers[i].name);
+		// 64-bit numbers: ioreg shows a 32-bit value with bit 31 set sign-extended
+		s.fbcGuardDevice->setProperty(key, values[i], 64);
+	}
+	snprintf(key, sizeof(key), "%s-generation", prefix);
+	s.fbcGuardDevice->setProperty(key, epoch >> 3, 64);
+	if (s.hibernateState) {
+		snprintf(key, sizeof(key), "%s-hibernate", prefix);
+		s.fbcGuardDevice->setProperty(key, static_cast<uint32_t>(__atomic_load_n(&s.fbcWakeHibernate, __ATOMIC_RELAXED)), 32);
+	}
+	// A newer ready generation reschedules its own 3 s sample; only this generation queues its 30 s one.
+	if (!step && s.token() == epoch) {
+		__atomic_store_n(&s.fbcWakeStep, 1U, __ATOMIC_RELAXED);
+		uint64_t deadline;
+		clock_interval_to_deadline(27, kSecondScale, &deadline);
+		thread_call_enter_delayed(static_cast<thread_call_t>(s.fbcWakeCall), deadline);
+	}
 }
 
 IOReturn IGFX::wrapControllerPower(IOService *controller, unsigned long state, IOService *device) {
@@ -399,6 +466,9 @@ IOReturn IGFX::wrapControllerPower(IOService *controller, unsigned long state, I
 	s.modRPSControlPatch.invalidatePower();
 	if (s.fbcGuardDevice)
 		s.fbcGuardDevice->setProperty("weg-gpu-power-generation", transition >> 3, 64);
+	// kIOHibernateStateWakingFromHibernate (2) lasts until hibernate post-wake, after the controller powers up.
+	if (state == 2 && s.hibernateState)
+		__atomic_store_n(&s.fbcWakeHibernate, __atomic_load_n(s.hibernateState, __ATOMIC_RELAXED) == 2, __ATOMIC_RELAXED);
 	auto result = s.orgControllerPower(controller, state, device);
 	// CFL 24H232 performs its power-up path at ordinal 2 and acknowledges synchronously.
 	auto next = (transition & ~7ULL) | (state == 2 && !result ? AwaitClock : Off);
@@ -744,8 +814,10 @@ uint32_t IGFX::MMIORegistersReadSupport::wrapReadRegister32(void *controller, ui
 			void *owner = nullptr;
 			if (__atomic_compare_exchange_n(&s.powerController, &owner, controller, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || owner == controller) {
 				__atomic_store_n(&s.readyWake, wake, __ATOMIC_RELEASE);
-				if (__atomic_compare_exchange_n(&s.powerToken, &epoch, (epoch & ~7ULL) | Ready, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+				if (__atomic_compare_exchange_n(&s.powerToken, &epoch, (epoch & ~7ULL) | Ready, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
 					s.modRPSControlPatch.observeDisplayRead(address, value, (epoch & ~7ULL) | Ready);
+					s.scheduleFBCWakeSample(controller, (epoch & ~7ULL) | Ready);
+				}
 			}
 		}
 		return value;

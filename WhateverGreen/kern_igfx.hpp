@@ -279,6 +279,18 @@ private:
 	}
 	bool fbcReady(void *controller) const;
 	void installLifecycle(KernelPatcher &, size_t, mach_vm_address_t, size_t);
+	/**
+	 *  Wake diagnostics (-igfxpmlifecycle with igfxpwr bit 1): 3 s and 30 s after the GPU is ready again,
+	 *  read the FBC control, status, workaround and buffer registers once each. Reads only, no writes.
+	 */
+	void *fbcWakeCall {nullptr};
+	void *fbcWakeController {nullptr};
+	uint64_t fbcWakeEpoch {UINT64_MAX};
+	uint32_t fbcWakeStep {0};
+	bool fbcWakeBoot {false}, fbcWakeScheduled {false}, fbcWakeHibernate {false};
+	const uint32_t *hibernateState {nullptr};
+	void scheduleFBCWakeSample(void *controller, uint64_t epoch);
+	static void sampleFBCWake(void *, void *);
 	IORegistryEntry *fbcGuardDevice {nullptr};
 	void (*orgUpdateFBC)(void *, uint32_t) {nullptr};
 	static void wrapUpdateFBC(void *framebuffer, uint32_t event);
