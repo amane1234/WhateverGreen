@@ -468,6 +468,9 @@ constexpr uint32_t ArbiterWorkarounds = 0x80008000;
 // for ILK_DPFC_CB_BASE in hwFBCSet; +0x38A0 FBC feature, +0x38A8 FBC state recorded by WriteFBCControl.
 constexpr uint32_t SlotTable = 0x37B8, SlotStride = 0x28, CFBSlot = 4;
 constexpr uint64_t MiB = 1ULL << 20;
+// Not a verdict: the plane FBC tracks is off, e.g. inside a modeset where hwFBCSet enables FBC before the
+// plane. Nothing is compressed then; the next check of an enabled plane decides.
+const char FBCPlaneOff[] = "primary plane off";
 }
 
 uint64_t IGFX::fbcSignature(const FBCCheck &c) {
@@ -510,7 +513,7 @@ const char *IGFX::readFBCState(IOService *controller, FBCCheck &c, bool native) 
 const char *IGFX::validateFBC(IOService *controller, FBCCheck &c) {
 	// Linux intel_fbc_check_plane, Gen9 (DISPLAY_VER 9, not BXT/GLK)
 	if (!(c.planeCtl & (1U << 31)))
-		return "primary plane off";
+		return FBCPlaneOff;
 	const uint32_t format = (c.planeCtl >> 24) & 0xF, tiling = (c.planeCtl >> 10) & 7, rotation = c.planeCtl & 3;
 	// pixel_format_is_valid: 8:8:8:8 or RGB565. i915 also leaves out formats with alpha; Apple's driver
 	// compresses its primary plane without glitches, so the alpha mode (bits 5:4) is not a reason here.
@@ -689,7 +692,8 @@ void IGFX::wrapWriteFBCControl(void *controller, uint32_t value) {
 					__atomic_store_n(&s.fbcValidSignature, check.signature, __ATOMIC_RELEASE);
 					__atomic_store_n(&s.fbcValidEpoch, epoch, __ATOMIC_RELEASE);
 				}
-				s.setFBCVeto(reason);
+				if (reason != FBCPlaneOff)
+					s.setFBCVeto(reason);
 			}
 		}
 	}
@@ -736,6 +740,8 @@ void IGFX::refreshFBC(void *, void *) {
 			if (!enabled && !held)
 				return kIOReturnSuccess;
 			const char *reason = s.validateFBC(controller, check);
+			if (reason == FBCPlaneOff)
+				return kIOReturnSuccess;
 #ifdef DEBUG
 			if (s.fbcGuardDevice) {
 				s.fbcGuardDevice->setProperty("weg-fbc-check-plane-ctl", check.planeCtl, 64);
