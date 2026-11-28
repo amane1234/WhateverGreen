@@ -233,6 +233,13 @@ private:
 	uint64_t fbcSkipped {0}, fbcPassed {0}, fbcTimerOn {0}, fbcTimerOff {0};
 	uint64_t fbcStatusReads {0}, fbcCompressedReads {0};
 	bool traceFBC {false};
+	// Hardware view of FBC, read right after Apple's own FBC paths ran (display powered):
+	// samples, samples with DPFC_CONTROL enabled, of those with compressed segments, enable flips
+	uint64_t fbcHwSamples {0}, fbcHwEnabled {0}, fbcHwCompressing {0}, fbcHwToggles {0};
+	uint64_t fbcHwNext {0}, fbcHwInterval {0};
+	uint32_t fbcHwControl {UINT32_MAX}, fbcHwStatus {UINT32_MAX};
+	bool fbcHwSampling {false};
+	void sampleFBCHardware(void *controller);
 
 	/**
 	 *  IGPU support

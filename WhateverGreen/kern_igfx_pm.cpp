@@ -1083,6 +1083,16 @@ void IGFX::RPSControlPatch::publishTelemetry(const Event &event) {
 		publishCounter("weg-fbc-timer-off-requests", callbackIGFX->fbcTimerOff);
 		publishCounter("weg-fbc-status-reads", callbackIGFX->fbcStatusReads);
 		publishCounter("weg-fbc-compressed-reads", callbackIGFX->fbcCompressedReads);
+		publishCounter("weg-fbc-hw-samples", callbackIGFX->fbcHwSamples);
+		publishCounter("weg-fbc-hw-enabled", callbackIGFX->fbcHwEnabled);
+		publishCounter("weg-fbc-hw-compressing", callbackIGFX->fbcHwCompressing);
+		publishCounter("weg-fbc-hw-toggles", callbackIGFX->fbcHwToggles);
+		auto control = __atomic_load_n(&callbackIGFX->fbcHwControl, __ATOMIC_RELAXED);
+		auto status = __atomic_load_n(&callbackIGFX->fbcHwStatus, __ATOMIC_RELAXED);
+		if (control != UINT32_MAX) {
+			publish("weg-fbc-hw-last-control", control);
+			publish("weg-fbc-hw-last-status2", status);
+		}
 	}
 	if (event.v0 == UINT32_MAX)
 		unpublish("weg-power-rc6-permille");

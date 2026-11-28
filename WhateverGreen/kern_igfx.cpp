@@ -367,9 +367,42 @@ void IGFX::wrapUpdateFBC(void *framebuffer, uint32_t event) {
 			return;
 		}
 	}
-	if (__atomic_load_n(&callbackIGFX->traceFBC, __ATOMIC_RELAXED))
+	const bool trace = __atomic_load_n(&callbackIGFX->traceFBC, __ATOMIC_RELAXED);
+	if (trace)
 		__atomic_fetch_add(&callbackIGFX->fbcPassed, 1ULL, __ATOMIC_RELAXED);
 	callbackIGFX->orgUpdateFBC(framebuffer, event);
+	if (trace)
+		callbackIGFX->sampleFBCHardware(controller);
+}
+
+/**
+ *  Apple's driver never reads the FBC status through the hooked accessor, so passive observation sees
+ *  nothing. Read DPFC_CONTROL (0x43208) and DPFC_STATUS2 (0x43214, compressed segments in bits 10:0, as
+ *  i915 intel_fbc_is_compressing) right after Apple's own FBC paths, while the display is powered.
+ *  At most every 50 ms; reads bypass the hook so they do not count as native reads.
+ */
+void IGFX::sampleFBCHardware(void *controller) {
+	const uint64_t now = mach_absolute_time();
+	if (!controller || now < __atomic_load_n(&fbcHwNext, __ATOMIC_RELAXED) ||
+		__atomic_exchange_n(&fbcHwSampling, true, __ATOMIC_ACQUIRE))
+		return;
+	__atomic_store_n(&fbcHwNext, now + fbcHwInterval, __ATOMIC_RELAXED);
+	const uint32_t control = readRegister32(controller, 0x43208);
+	const uint32_t status = readRegister32(controller, 0x43214);
+	if (control != UINT32_MAX && status != UINT32_MAX) {
+		__atomic_fetch_add(&fbcHwSamples, 1ULL, __ATOMIC_RELAXED);
+		if (control & (1U << 31)) {
+			__atomic_fetch_add(&fbcHwEnabled, 1ULL, __ATOMIC_RELAXED);
+			if (status & 0x7FF)
+				__atomic_fetch_add(&fbcHwCompressing, 1ULL, __ATOMIC_RELAXED);
+		}
+		const uint32_t previous = __atomic_load_n(&fbcHwControl, __ATOMIC_RELAXED);
+		if (previous != UINT32_MAX && ((previous ^ control) & (1U << 31)))
+			__atomic_fetch_add(&fbcHwToggles, 1ULL, __ATOMIC_RELAXED);
+		__atomic_store_n(&fbcHwControl, control, __ATOMIC_RELAXED);
+		__atomic_store_n(&fbcHwStatus, status, __ATOMIC_RELAXED);
+	}
+	__atomic_store_n(&fbcHwSampling, false, __ATOMIC_RELEASE);
 }
 
 void IGFX::wrapWriteFBCControl(void *controller, uint32_t value) {
@@ -382,6 +415,9 @@ void IGFX::wrapWriteFBCControl(void *controller, uint32_t value) {
 	else if (offset == 0xB4 && !(value & (1U << 31)))
 		__atomic_fetch_add(&callbackIGFX->fbcTimerOff, 1ULL, __ATOMIC_RELAXED);
 	callbackIGFX->orgWriteFBCControl(controller, value);
+	// Force the next sample so the state right after Apple's write is seen.
+	__atomic_store_n(&callbackIGFX->fbcHwNext, 0ULL, __ATOMIC_RELAXED);
+	callbackIGFX->sampleFBCHardware(controller);
 }
 
 bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -443,6 +479,7 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 						KernelPatcher::RouteRequest writeRoute("__ZN31AppleIntelFramebufferController15WriteFBCControlEj",
 							wrapWriteFBCControl, orgWriteFBCControl);
 						if (fbcTimerCallback && patcher.routeMultiple(index, &writeRoute, 1, address, size)) {
+							nanoseconds_to_absolutetime(50000000ULL, &fbcHwInterval);
 							__atomic_store_n(&traceFBC, true, __ATOMIC_RELEASE);
 							fbcGuardDevice->setProperty("weg-fbc-trace", "installed");
 						} else {
