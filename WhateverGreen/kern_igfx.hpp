@@ -250,7 +250,8 @@ private:
 	 *  only lowered when that region is at the top and no larger than the requested margin.
 	 */
 	uint32_t fbcMarginMB {0};
-	void checkFBCMargin(IORegistryEntry *device, uint32_t margin);
+	IORegistryEntry *fbcMarginDevice {nullptr};
+	bool checkFBCMargin();
 	void applyFBCMargin(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
 
 	/**
